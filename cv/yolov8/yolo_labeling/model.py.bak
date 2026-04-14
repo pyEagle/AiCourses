@@ -1,0 +1,215 @@
+# -*- coding:utf-8 -*-
+
+import os
+import shutil
+import random
+import cv2
+import torch
+from typing import List, Dict, Optional
+from ultralytics import YOLO
+from label_studio_ml.model import LabelStudioMLBase
+from label_studio_ml.response import ModelResponse
+from label_studio_ml.utils import get_image_size, get_local_path
+
+
+class NewModel(LabelStudioMLBase):
+    def setup(self):
+        self.set("model_version", "yolo_v8_initial")
+        model_path = '/usr/rfzn/yolo_backend/best07.pt'
+        self.model = YOLO(model_path)
+        
+        self.yaml_path = '/usr/rfzn/yolo_backend/coco.yaml'
+        
+        self.dataset_root = '/usr/rfzn/yolo_backend/dataset'
+
+        self.train_img_dir = os.path.join(self.dataset_root, 'images', 'train')
+        self.train_label_dir = os.path.join(self.dataset_root, 'labels', 'train')
+        self.val_img_dir = os.path.join(self.dataset_root, 'images', 'val')
+        self.val_label_dir = os.path.join(self.dataset_root, 'labels', 'val')
+        self.test_img_dir = os.path.join(self.dataset_root, 'images', 'test')
+        self.test_label_dir = os.path.join(self.dataset_root, 'labels', 'test')
+        
+        for dir_path in [self.train_img_dir, self.train_label_dir, 
+                        self.val_img_dir, self.val_label_dir,
+                        self.test_img_dir, self.test_label_dir]:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        self.from_name = "label"
+        self.to_name = "image"
+        label_config = self.parsed_label_config
+        schema = label_config.get(self.from_name)
+        self.all_classes = schema['labels']
+
+        self.train_ratio = 0.8
+
+    def split_train_val(self):
+        label_files = [f for f in os.listdir(self.train_label_dir) if f.endswith('.txt')]
+        if not label_files:
+            print("警告：暂无标注数据可划分")
+            return
+        
+        split_idx = int(len(label_files) * self.train_ratio)
+        train_files = label_files[:split_idx]
+        val_files = label_files[split_idx:]
+        
+        for f in os.listdir(self.val_label_dir):
+            os.remove(os.path.join(self.val_label_dir, f))
+        for f in os.listdir(self.val_img_dir):
+            os.remove(os.path.join(self.val_img_dir, f))
+        
+        for label_file in val_files:
+            src_label = os.path.join(self.train_label_dir, label_file)
+            dst_label = os.path.join(self.val_label_dir, label_file)
+            shutil.copy2(src_label, dst_label)
+            
+            img_name = os.path.splitext(label_file)[0]
+            img_found = False
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                img_file = img_name + ext
+                src_img = os.path.join(self.train_img_dir, img_file)
+                if os.path.exists(src_img):
+                    dst_img = os.path.join(self.val_img_dir, img_file)
+                    shutil.copy2(src_img, dst_img)
+                    img_found = True
+                    break
+            if not img_found:
+                print(f"警告：未找到{img_name}对应的图片文件")
+
+    def predict(self, tasks, context, **kwargs):
+        predictions = []
+        
+        for task in tasks:
+            image_url = task['data'].get(self.to_name)
+            image_path = self.get_local_path(image_url)
+            results = self.model.predict(image_path, conf=0.5)
+
+            result_list = []
+            img_width, img_height = get_image_size(image_path)
+            for res in results:
+                for box in res.boxes:
+                    xyxy = box.xyxy[0].tolist()
+                    x = xyxy[0] / img_width * 100
+                    y = xyxy[1] / img_height * 100
+                    w = (xyxy[2] - xyxy[0]) / img_width * 100
+                    h = (xyxy[3] - xyxy[1]) / img_height * 100
+                    
+                    label_idx = int(box.cls[0])
+                    label = self.model.names[label_idx] if label_idx < len(self.model.names) else "unknown"
+                    if label not in self.all_classes:
+                        continue
+
+                    result_list.append({
+                        "from_name": self.from_name,
+                        "to_name": self.to_name,
+                        "type": "rectanglelabels",
+                        "value": {
+                            "rectanglelabels": [label],
+                            "x": x, "y": y, "width": w, "height": h
+                        },
+                        "score": float(box.conf[0])
+                    })
+
+            predictions.append({
+                "result": result_list,
+                "model_version": self.get("model_version")
+            })
+
+        return ModelResponse(predictions=predictions)
+
+    def fit(self, event, data, **kwargs):
+        if event not in ('ANNOTATION_CREATED', 'ANNOTATION_UPDATED'):
+            return
+
+        print(f"收到事件 {event}，准备收集数据进行增量训练...")
+        
+        annotation = data.get('annotation')
+        if not annotation:
+            print("警告：未找到标注数据")
+            return
+
+        image_url = data['task']['data'][self.to_name]
+        image_path = self.get_local_path(image_url)
+        img_width, img_height = get_image_size(image_path)
+
+        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        label_file = os.path.join(self.train_label_dir, f"{image_name}.txt")
+        
+        try:
+            with open(label_file, 'w') as f:
+                for shape in annotation['result']:
+                    if shape['type'] == 'rectanglelabels':
+                        class_name = shape['value']['rectanglelabels'][0]
+                        
+                        if class_name not in self.all_classes:
+                            raise ValueError(
+                                f"标注类别「{class_name}」不在Label Studio配置的类别列表中！"
+                                f"平台配置类别：{self.all_classes}"
+                            )
+
+                        class_id = self.all_classes.index(class_name)
+                        
+                        x = shape['value']['x'] / 100 * img_width
+                        y = shape['value']['y'] / 100 * img_height
+                        w = shape['value']['width'] / 100 * img_width
+                        h = shape['value']['height'] / 100 * img_height
+                        
+                        center_x = (x + w / 2) / img_width
+                        center_y = (y + h / 2) / img_height
+                        f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {w / img_width:.6f} {h / img_height:.6f}\n")
+            
+            train_image_path = os.path.join(self.train_img_dir, os.path.basename(image_path))
+            if not os.path.exists(train_image_path):
+                img = cv2.imread(image_path)
+                if img is not None:
+                    cv2.imwrite(train_image_path, img)
+                else:
+                    print(f"警告：无法读取图片 {image_path}")
+                    return
+            
+            count_str = self.get('count')
+            current_count = int(count_str) if count_str else 0
+            current_count += 1
+            self.set('count', str(current_count))
+            
+            print(f"目前已收集标注数: {current_count}")
+            
+            if current_count % 100 == 0:
+                print(f"达到阈值 ({current_count}个标注)，开始划分数据集并更新模型...")
+                
+                self.split_train_val()
+                
+                self.update_yaml_file()
+                
+                self.model.train(
+                    data=self.yaml_path,
+                    epochs=5,
+                    imgsz=640,
+                    batch=8,
+                    exist_ok=True,
+                    val=True,
+                    patience=3,
+                )
+                
+                new_version = f"yolo_v8_rev_{current_count}"
+                self.set("model_version", new_version)
+                print(f"模型已更新至版本: {new_version}")
+        
+        except Exception as e:
+            print(f"处理标注数据时出错：{str(e)}")
+            if os.path.exists(label_file):
+                os.remove(label_file)
+
+    def update_yaml_file(self):
+        try:
+            with open(self.yaml_path, 'w', encoding='utf-8') as f:
+                f.write(f"path: {self.dataset_root}\n")
+                f.write("train: images/train\n")
+                f.write("val: images/val\n")
+                f.write("test: images/test\n")
+                f.write("names:\n")
+                for i, cls in enumerate(self.all_classes):
+                    f.write(f"  {i}: {cls}\n")
+            print(f"成功更新yaml配置文件：{self.yaml_path}")
+        except Exception as e:
+            print(f"更新yaml文件失败：{str(e)}")
+

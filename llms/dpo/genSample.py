@@ -1,0 +1,36 @@
+# -*- coding: utf-8 -*-
+import json
+
+# 你的20条DPO训练数据
+data = [
+    {"prompt": "请解释什么是Python中的列表推导式", "chosen": "列表推导式是Python中简洁创建列表的语法，格式为[表达式 for 变量 in 可迭代对象 if 条件]，一行代码就能替代多行循环，简洁高效。例如：[x*2 for x in range(5)]会生成[0,2,4,6,8]。", "rejected": "列表推导式就是用来做列表的，挺好用的，具体怎么写我也不太清楚。"},
+    {"prompt": "如何解决Python代码报错IndentationError", "chosen": "IndentationError是缩进错误，Python强制使用4个空格或1个Tab缩进，不能混用。解决方法：统一缩进格式、检查代码层级、删除多余空格/制表符。", "rejected": "报错就重启电脑，一般都能好，不用管缩进。"},
+    {"prompt": "请简述人工智能的核心应用领域", "chosen": "人工智能核心应用包括计算机视觉、自然语言处理、语音识别、推荐系统、自动驾驶、智能机器人、医疗诊断、金融风控八大领域。", "rejected": "人工智能就是玩游戏、看视频用的，别的没什么用。"},
+    {"prompt": "写一个简单的HTML页面结构", "chosen": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <title>页面标题</title>\n</head>\n<body>\n    <h1>Hello World</h1>\n</body>\n</html>", "rejected": "html随便写点文字就行，不用管格式。"},
+    {"prompt": "MySQL中如何查询表中前10条数据", "chosen": "使用LIMIT关键字，SQL语句：SELECT * FROM 表名 LIMIT 10; 该语句会返回表中最前面的10条记录。", "rejected": "查询前10条数据很麻烦，需要写很多复杂代码。"},
+    {"prompt": "什么是面向对象编程的三大特性", "chosen": "面向对象三大特性：封装（隐藏内部实现）、继承（复用代码）、多态（同一接口不同实现），是OOP的核心设计思想。", "rejected": "面向对象就是写类，别的特性我不清楚。"},
+    {"prompt": "请说明CPU和GPU的区别", "chosen": "CPU擅长串行复杂计算，核心少、处理逻辑强；GPU擅长并行简单计算，核心多、算力密集，主要用于图形渲染和AI训练。", "rejected": "CPU和GPU差不多，都是电脑配件，没什么区别。"},
+    {"prompt": "Git中如何撤销最近一次提交", "chosen": "使用git reset --soft HEAD^ 撤销最近一次提交且保留代码；git reset --hard HEAD^ 彻底撤销（谨慎使用），根据需求选择。", "rejected": "撤销提交只能删除文件，没有别的办法。"},
+    {"prompt": "请解释什么是API接口", "chosen": "API是应用程序编程接口，是不同软件系统间通信的规则，定义了请求方式、参数、返回格式，让系统可以安全交互数据。", "rejected": "API就是一个网址，没什么特别的。"},
+    {"prompt": "Linux中如何查看文件内容", "chosen": "常用命令：cat（查看全部）、less（分页查看）、head（查看前几行）、tail（查看后几行），根据文件大小选择使用。", "rejected": "Linux看文件只能用记事本打开。"},
+    {"prompt": "请简述深度学习和机器学习的关系", "chosen": "深度学习是机器学习的子集，基于深度神经网络，无需手动提取特征，自动学习数据特征，适合大数据、高复杂度任务。", "rejected": "深度学习和机器学习完全一样，没有区别。"},
+    {"prompt": "CSS中如何让元素水平居中", "chosen": "行内元素用text-align: center；块级元素用margin: 0 auto；弹性布局用display: flex + justify-content: center。", "rejected": "元素居中直接敲空格就行。"},
+    {"prompt": "什么是Token，在大模型中作用是什么", "chosen": "Token是大模型的最小文本单元（字/词/符号），模型通过Token理解文本、计算长度、限制输入输出，是大模型处理语言的基础单位。", "rejected": "Token就是模型的密码，没什么用。"},
+    {"prompt": "Java中int和Integer的区别", "chosen": "int是基本数据类型，无默认值、效率高；Integer是包装类，默认值null、支持泛型，自动装箱拆箱实现两者转换。", "rejected": "int和Integer一样，随便用。"},
+    {"prompt": "如何优化网页加载速度", "chosen": "优化方案：压缩图片、合并CSS/JS、启用CDN、缓存静态资源、减少HTTP请求、懒加载、代码压缩，全面提升加载效率。", "rejected": "网页加载慢就换浏览器，不用优化。"},
+    {"prompt": "什么是RESTful API设计规范", "chosen": "RESTful是API设计风格，核心：使用HTTP方法（GET/POST/PUT/DELETE）表示操作、URL使用名词、无状态、返回标准状态码。", "rejected": "RESTful就是随便写接口，没有规范。"},
+    {"prompt": "Python中装饰器的作用是什么", "chosen": "装饰器是高阶函数，在不修改原函数代码的前提下，为函数添加额外功能（日志、计时、权限校验），遵循开放封闭原则。", "rejected": "装饰器没用，不用学。"},
+    {"prompt": "大模型微调LoRA的优势是什么", "chosen": "LoRA仅训练低秩矩阵，参数少、显存占用低、训练速度快、模型体积小，适合小显存设备做高效微调。", "rejected": "LoRA和全量微调一样，没什么优势。"},
+    {"prompt": "Windows和macOS系统的核心区别", "chosen": "Windows兼容性强、软件丰富、适合游戏办公；macOS流畅稳定、生态封闭、适合设计开发，硬件绑定、续航优秀。", "rejected": "两个系统一模一样，没区别。"},
+    {"prompt": "什么是Docker，核心作用是什么", "chosen": "Docker是容器化工具，将应用与环境打包成容器，实现一次构建、随处运行，解决环境不一致、部署复杂的问题。", "rejected": "Docker就是一个软件，用来下载东西的。"}
+]
+
+# 序列化保存为 train.json
+with open("train.json", "w", encoding="utf-8") as f:
+    # ensure_ascii=False 保证中文不乱码
+    # indent=2 让文件格式化易读
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+print("✅ 序列化完成！已生成 train.json 文件")
+print(f"📊 共包含 {len(data)} 条训练样本")
+
