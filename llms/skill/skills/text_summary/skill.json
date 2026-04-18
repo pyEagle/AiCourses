@@ -1,0 +1,19 @@
+{
+    "name": "text_summarizer",
+    "description": "文本摘要提取技能，可自动识别长文本并生成简洁摘要",
+    "version": "1.0.0",
+    "author": "skill_demo",
+    "tools": [
+        "summarize_text",
+        "extract_keywords"
+    ],
+    "triggers": [
+        "摘要",
+        "总结",
+        "概括",
+        "summarize",
+        "summary"
+    ],
+    "auto_detect": true,
+    "min_text_length": 100
+}
