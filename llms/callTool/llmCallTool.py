@@ -1,8 +1,9 @@
 # -*- coding:utf-8 -*-
  
 import re
-import requests
 import json
+
+import requests
  
 def calculate(expression):
     expression = re.sub(r'[^0-9+\-*/(). ]', '', expression)

@@ -1,0 +1,15 @@
+[
+    {
+        "question": "智能体支持哪些技能",
+        "answer": "当前智能体支持的技能包括：\n1. 天气查询（weather_query）：查询指定城市的天气\n2. 计算器（calculator）：执行数学计算"
+    },
+    {
+        "question": "智能体可以调用哪些工具",
+        "answer": "当前智能体支持调用网页搜索工具（web_search），用于获取最新的网络信息。"
+    },
+    {
+        "question": "如何使用计算器技能",
+        "answer": "使用计算器技能需要按照格式调用：[[calculator expression=数学表达式]]，例如：[[calculator expression=1+2*3]] 或 [[calculator expression=sqrt(16)]]"
+    }
+]
+
