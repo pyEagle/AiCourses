@@ -89,7 +89,7 @@ class CodeGenerator:
                     return output, log
                 else:
                     prompt = self.error_prompt.format(self.user_description, log, correct_example)
-            except ValueError as e:
+            except Exception as e:
                 print(f"❌ {e}")
                 prompt = self.error_prompt.format(self.user_description, e, correct_example)
 
