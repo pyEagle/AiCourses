@@ -18,6 +18,8 @@ class CodeGenerator:
             r'os\.system\["rmdir ["\'].*\)'
         ]
 
+        self.error_prompt = "用户需求: {}\n错误信息: {}\n请修复代码并重新输出结构化 JSON，确保包含必需字段。正确示例: {}"
+
     def generate_code(self, prompt):
         payload = {
             "model": "deepseek-r1:latest",
@@ -74,7 +76,7 @@ class CodeGenerator:
 
     def fix_and_retry(self, prompt, max_retries=5):
         for i in range(max_retries):
-            print(f"尝试第 {i + 1} 次生成...")
+            print(f"尝试第{i+1}次生成...")
             code_output = self.generate_code(prompt)
             try:
                 output = json.loads(code_output)
@@ -86,13 +88,10 @@ class CodeGenerator:
                 if success:
                     return output, log
                 else:
-                    prompt = f"用户需求: {self.user_description}\n错误信息: {log}\n请修复代码并重新输出结构化 JSON，确保包含必需字段。正确示例: {correct_example}"
-            except json.JSONDecodeError:
-                print("❌ 生成的 JSON 格式错误，尝试修复...")
-                prompt = f"用户需求: {self.user_description}\n错误信息: 生成的 JSON 格式无效\n请输出合法的 JSON，确保包含必需字段。正确示例: {correct_example}"
+                    prompt = self.error_prompt.format(self.user_description, log, correct_example)
             except ValueError as e:
                 print(f"❌ {e}")
-                prompt = f"用户需求: {self.user_description}\n错误信息: {e}\n请输出包含必需字段的 JSON。正确示例: {correct_example}"
+                prompt = self.error_prompt.format(self.user_description, e, correct_example)
 
         raise Exception("❌ 达到最大重试次数，无法生成有效代码")
 
