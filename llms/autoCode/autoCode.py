@@ -69,7 +69,7 @@ class Memory:
                 if success:
                     item["code"] = code
 
-                item["emb"] = v_old  # 保留embedding
+                item["emb"] = v_old
 
                 self.clean()
                 self.save()
@@ -81,7 +81,7 @@ class Memory:
             "success": 1 if success else 0,
             "fail": 0 if success else 1,
             "count": 1,
-            "emb": v_new   # ⭐存embedding
+            "emb": v_new
         })
 
         self.clean()
@@ -117,7 +117,7 @@ class Memory:
             beta = item["fail"] + 1
             theta = random.betavariate(alpha, beta)
 
-            context_weight = (sim + 1) / 2  # 映射到 [0,1]
+            context_weight = (sim + 1) / 2
 
             score = sim * theta * context_weight
             scores.append(score)
@@ -139,6 +139,24 @@ class CodeGenerator:
         self.memory = Memory()
 
         self.error_prompt = "用户需求: {}\n错误信息: {}\n请修复代码并输出JSON。示例: {}"
+
+        self.dangerous_patterns = [
+            r"rm\s+-rf\s+\/",
+            r"rm\s+-rf\s+\*",
+            r"os\.system\(.+rm\s+-rf.+\)",
+            r"subprocess\..*\(.+rm\s+-rf.+\)",
+            r"shutil\.rmtree",
+            r"os\.remove\(",
+            r"os\.unlink\(",
+            r"eval\(",
+            r"exec\("
+        ]
+
+    def is_dangerous_code(self, code_text):
+        for pattern in self.dangerous_patterns:
+            if re.search(pattern, code_text):
+                return True, pattern
+        return False, None
 
     def enhance_prompt(self, base_prompt):
         cases = self.memory.retrieve(self.user_description)
@@ -181,6 +199,19 @@ class CodeGenerator:
             try:
                 out = json.loads(raw)
 
+                code_text = "\n".join(f["code"] for f in out["files"])
+
+                dangerous, pattern = self.is_dangerous_code(code_text)
+                if dangerous:
+                    print(f"⚠️ 检测到危险代码: {pattern}")
+                    self.memory.add_case(self.user_description, code_text, False)
+                    prompt = self.error_prompt.format(
+                        self.user_description,
+                        f"检测到危险操作: {pattern}",
+                        correct_example
+                    )
+                    continue
+
                 cmd = out["main"]
 
                 for f in out["files"]:
@@ -189,8 +220,6 @@ class CodeGenerator:
                         fp.write(f["code"])
 
                 ok, log = self.run_code(cmd)
-
-                code_text = "\n".join(f["code"] for f in out["files"])
 
                 if ok:
                     self.memory.add_case(self.user_description, code_text, True)
@@ -209,6 +238,7 @@ def main():
     task = "写一个函数计算两个数相加并输出"
 
     prompt = f"""
+角色：人工智能资深专家
 任务: {task}
 要求:
 1. Python
@@ -226,4 +256,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
