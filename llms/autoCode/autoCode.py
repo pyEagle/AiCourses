@@ -3,116 +3,227 @@ import os
 import subprocess
 import requests
 import re
+import math
+import random
 
-correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
+from collections import Counter
+from sentence_transformers import SentenceTransformer
+
+MEMORY_FILE = "memory.json"
+
+correct_example = '{"path": "./", "files": [{"code": "print(1+2)", "pyfile": "test.py"}], "main": "python test.py"}'
+
+
+class SimpleEmbedding:
+    def __init__(self):
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.use_transformer = True
+        print("✅ 使用 Transformer Embedding")
+
+    def vectorize(self, text):
+        return self.model.encode(text).tolist()
+
+    def cosine(self, v1, v2):
+        import numpy as np
+        v1, v2 = np.array(v1), np.array(v2)
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 == 0 or n2 == 0:
+            return 0
+        return float(v1 @ v2 / (n1 * n2))
+
+
+class Memory:
+    def __init__(self):
+        self.embed = SimpleEmbedding()
+        self.data = self.load()
+
+        self.sim_threshold = 0.85
+        self.max_size = 50
+
+    def load(self):
+        if not os.path.exists(MEMORY_FILE):
+            return []
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+
+    def save(self):
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+
+    def add_case(self, task, code, success):
+        v_new = self.embed.vectorize(task)
+
+        for item in self.data:
+            v_old = item.get("emb") or self.embed.vectorize(item["task"])
+            sim = self.embed.cosine(v_new, v_old)
+
+            if sim > self.sim_threshold:
+                if success:
+                    item["success"] += 1
+                else:
+                    item["fail"] += 1
+
+                item["count"] += 1
+
+                if success:
+                    item["code"] = code
+
+                item["emb"] = v_old  # 保留embedding
+
+                self.clean()
+                self.save()
+                return
+
+        self.data.append({
+            "task": task,
+            "code": code,
+            "success": 1 if success else 0,
+            "fail": 0 if success else 1,
+            "count": 1,
+            "emb": v_new   # ⭐存embedding
+        })
+
+        self.clean()
+        self.save()
+
+    def clean(self):
+        if not self.data:
+            return
+
+        self.data = [
+            x for x in self.data
+            if x["success"] >= x["fail"]
+        ]
+
+        def score(x):
+            return (x["success"] / (x["success"] + x["fail"] + 1)) * math.log(1 + x["count"])
+
+        self.data.sort(key=score, reverse=True)
+        self.data = self.data[:self.max_size]
+
+    def retrieve(self, task, top_k=2):
+        if not self.data:
+            return []
+
+        v1 = self.embed.vectorize(task)
+        scores = []
+
+        for item in self.data:
+            v2 = item.get("emb") or self.embed.vectorize(item["task"])
+            sim = self.embed.cosine(v1, v2)
+
+            alpha = item["success"] + 1
+            beta = item["fail"] + 1
+            theta = random.betavariate(alpha, beta)
+
+            context_weight = (sim + 1) / 2  # 映射到 [0,1]
+
+            score = sim * theta * context_weight
+            scores.append(score)
+
+        indices = list(range(len(self.data)))
+        chosen = set()
+
+        while len(chosen) < min(top_k, len(indices)):
+            idx = random.choices(indices, weights=scores, k=1)[0]
+            chosen.add(idx)
+
+        return [self.data[i] for i in chosen]
+
+
 class CodeGenerator:
     def __init__(self, user_description):
         self.user_description = user_description
-        self.ollama_url = "http://localhost:11434/api/generate" 
-        self.dangerous_operations = [
-            r'os\.remove\(.+\)',
-            r'os\.unlink\(.+\)',
-            r'shutil\.rmtree\(.+\)',
-            r'subprocess\.run\(["\']rm ["\'].*\)',
-            r'subprocess\.run\["rmdir ["\'].*\)',
-            r'os\.system\["rmdir ["\'].*\)'
-        ]
+        self.ollama_url = "http://localhost:11434/api/generate"
+        self.memory = Memory()
 
-        self.error_prompt = "用户需求: {}\n错误信息: {}\n请修复代码并重新输出结构化 JSON，确保包含必需字段。正确示例: {}"
+        self.error_prompt = "用户需求: {}\n错误信息: {}\n请修复代码并输出JSON。示例: {}"
 
-    def generate_code(self, prompt):
+    def enhance_prompt(self, base_prompt):
+        cases = self.memory.retrieve(self.user_description)
+
+        if not cases:
+            return base_prompt
+
+        hint = "\n【历史经验】\n"
+        for c in cases:
+            hint += f"任务: {c['task']}\n代码:\n{c['code']}\n"
+
+        return base_prompt + hint
+
+    def call_llm(self, prompt):
         payload = {
             "model": "deepseek-r1:latest",
             "prompt": prompt,
             "format": "json",
             "stream": False
         }
-        response = requests.post(self.ollama_url, json=payload)
-        if response.status_code == 200:
-            return response.json().get("response", "")
-        else:
-            raise Exception(f"Ollama 调用失败: {response.text}")
+        r = requests.post(self.ollama_url, json=payload)
+        return r.json().get("response", "")
 
-    def is_dangerous_code(self, code):
-        """检查代码是否包含危险操作"""
-        for pattern in self.dangerous_operations:
-            if re.search(pattern, code):
-                return True
-        return False
+    def run_code(self, cmd):
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return r.returncode == 0, r.stdout + r.stderr
 
-    def save_code(self, output):
-        path = output["path"]
-        for file in output["files"]:
-            if self.is_dangerous_code(file["code"]):
-                raise Exception("❌ 检测到危险操作：代码尝试删除系统文件")
-            
-            filename = os.path.join(path, file["pyfile"])
-            with open(filename, "w") as f:
-                f.write(file["code"])
-        return output["main"]
-
-    def run_code(self, main_command):
-        try:
-            result = subprocess.run(
-                main_command, shell=True, capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print("✅ 代码执行成功")
-                return True, result.stdout
-            else:
-                print(f"❌ 代码执行失败:\n{result.stderr}")
-                return False, result.stderr
-        except Exception as e:
-            print(f"❌ 执行异常: {e}")
-            return False, str(e)
-
-    def validate_output(self, output):
-        """验证输出是否包含必需的字段"""
-        required_fields = ["path", "files", "main"]
-        for field in required_fields:
-            if field not in output:
-                raise ValueError(f"生成的 JSON 缺少必需字段: '{field}'")
-        return True
+    def debug_code(self, error):
+        prompt = self.error_prompt.format(self.user_description, error, correct_example)
+        return self.call_llm(prompt)
 
     def fix_and_retry(self, prompt, max_retries=5):
-        for i in range(max_retries):
-            print(f"尝试第{i+1}次生成...")
-            code_output = self.generate_code(prompt)
-            try:
-                output = json.loads(code_output)
-                print(output)
-                print('--'*20)
-                self.validate_output(output)
-                main_command = self.save_code(output)
-                success, log = self.run_code(main_command)
-                if success:
-                    return output, log
-                else:
-                    prompt = self.error_prompt.format(self.user_description, log, correct_example)
-            except Exception as e:
-                print(f"❌ {e}")
-                prompt = self.error_prompt.format(self.user_description, e, correct_example)
+        prompt = self.enhance_prompt(prompt)
 
-        raise Exception("❌ 达到最大重试次数，无法生成有效代码")
+        for i in range(max_retries):
+            print("尝试:", i + 1)
+
+            raw = self.call_llm(prompt)
+
+            try:
+                out = json.loads(raw)
+
+                cmd = out["main"]
+
+                for f in out["files"]:
+                    os.makedirs(out["path"], exist_ok=True)
+                    with open(os.path.join(out["path"], f["pyfile"]), "w") as fp:
+                        fp.write(f["code"])
+
+                ok, log = self.run_code(cmd)
+
+                code_text = "\n".join(f["code"] for f in out["files"])
+
+                if ok:
+                    self.memory.add_case(self.user_description, code_text, True)
+                    return out, log
+                else:
+                    self.memory.add_case(self.user_description, code_text, False)
+                    prompt = self.enhance_prompt(self.debug_code(log))
+
+            except Exception as e:
+                prompt = self.error_prompt.format(self.user_description, str(e), correct_example)
+
+        raise Exception("失败")
+
 
 def main():
-    input_str = "创建一个函数，计算两个数的和，并在test.py中调用它。"
+    task = "写一个函数计算两个数相加并输出"
+
     prompt = f"""
-角色：你是一位大厂资深开发，在这个领域深耕20年了。
-背景：开发一个根据用户需求，自动生成完整可执行代码
-功能：{input_str}
-要求：1.所有代码必须是python写的，且完整可执行
-      2.结构化输出，参考用例 {correct_example}
-      3.执行python test.py，输出测试效果
-      4.如果报错，将错误信息给deepseek-r1:latest， deepseek-r1:latest再次按照2.结构化输出，直到代码运行成功，且实现了业务逻辑。
-输出：
-    1.实现功能所需要的代码
-    2.结构化输出，参考用例 {correct_example}
-    """
-    generator = CodeGenerator(input_str)
-    final_output, result_log = generator.fix_and_retry(prompt)
-    print("最终输出:", json.dumps(final_output, indent=2))
-    print("执行结果:", result_log)
+任务: {task}
+要求:
+1. Python
+2. JSON输出
+3. 可执行
+示例: {correct_example}
+"""
+
+    gen = CodeGenerator(task)
+    out, log = gen.fix_and_retry(prompt)
+
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print(log)
+
 
 if __name__ == "__main__":
     main()
+
