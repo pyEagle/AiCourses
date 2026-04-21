@@ -4,6 +4,7 @@ import subprocess
 import requests
 import re
 
+correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
 class CodeGenerator:
     def __init__(self, user_description):
         self.user_description = user_description
@@ -85,22 +86,18 @@ class CodeGenerator:
                 if success:
                     return output, log
                 else:
-                    correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
                     prompt = f"用户需求: {self.user_description}\n错误信息: {log}\n请修复代码并重新输出结构化 JSON，确保包含必需字段。正确示例: {correct_example}"
             except json.JSONDecodeError:
                 print("❌ 生成的 JSON 格式错误，尝试修复...")
-                correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
                 prompt = f"用户需求: {self.user_description}\n错误信息: 生成的 JSON 格式无效\n请输出合法的 JSON，确保包含必需字段。正确示例: {correct_example}"
             except ValueError as e:
                 print(f"❌ {e}")
-                correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
                 prompt = f"用户需求: {self.user_description}\n错误信息: {e}\n请输出包含必需字段的 JSON。正确示例: {correct_example}"
 
         raise Exception("❌ 达到最大重试次数，无法生成有效代码")
 
 def main():
     input_str = "创建一个函数，计算两个数的和，并在test.py中调用它。"
-    correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
     prompt = f"""
 角色：你是一位大厂资深开发，在这个领域深耕20年了。
 背景：开发一个根据用户需求，自动生成完整可执行代码
