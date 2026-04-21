@@ -100,7 +100,6 @@ class CodeGenerator:
 
 def main():
     input_str = "创建一个函数，计算两个数的和，并在test.py中调用它。"
-    # 修复：提供清晰的JSON示例
     correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
     prompt = f"""
 角色：你是一位大厂资深开发，在这个领域深耕20年了。
