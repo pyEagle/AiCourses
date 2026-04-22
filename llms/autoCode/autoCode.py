@@ -18,8 +18,7 @@ correct_example = '{"path": "./", "files": [{"code": "print(1+2)", "pyfile": "te
 
 class SimpleEmbedding:
     def __init__(self):
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        print("✅ 使用 Transformer Embedding")
+        self.model = SentenceTransformer("BAAI/bge-m3")
 
     def vectorize(self, text):
         return np.array(self.model.encode(text)).astype("float32")
