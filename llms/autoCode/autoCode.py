@@ -55,11 +55,9 @@ class PPOPolicy:
             p = probs[a]
             ratio = p / (old_p + 1e-8)
 
-            # ✅ 标准 PPO Clip 逻辑实现
             surr1 = ratio * adv
             surr2 = np.clip(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * adv
             
-            # 如果 surr1 超过了截断限制且对 loss 的贡献不再增加，则跳过此步梯度
             if surr1 > surr2:
                 continue
 
@@ -69,18 +67,13 @@ class PPOPolicy:
             grad_W1_total = np.zeros_like(self.W1)
             for i, st in enumerate(strategies):
                 emb = self.get_strategy_emb(st)
-                # 梯度方向基于优势函数 adv
                 grad = grad_logits[i] * adv 
                 
-                # 更新策略 Embedding
                 self.strategy_emb[st] -= self.lr * grad * h
-                # 聚合 W1 梯度
                 grad_W1_total += np.outer(s, (1 - h**2) * emb * grad)
 
-            # 统一更新 W1，避免梯度污染
             self.W1 -= self.lr * grad_W1_total
 
-        # 内存管理
         if len(self.strategy_emb) > 500:
             self.strategy_emb = dict(list(self.strategy_emb.items())[-300:])
 
