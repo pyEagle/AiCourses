@@ -174,7 +174,7 @@ class CodeGenerator:
 修复策略：{strategy}
 请只修复错误，不要改变原有功能，输出严格JSON。
 """
-            except Exception as e:
+            except Exception as err:
                 prompt = f"{base_prompt}\n错误：{err}\n请严格输出JSON，修复问题。"
 
         raise Exception("达到最大重试次数，生成失败")
