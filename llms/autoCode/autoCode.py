@@ -57,9 +57,7 @@ class PPOPolicy:
 
             surr1 = ratio * adv
             surr2 = np.clip(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * adv
-            
-            if surr1 > surr2:
-                continue
+            loss = -np.minimum(surr1, surr2)  # 标准PPO损失函数
 
             grad_logits = probs.copy()
             grad_logits[a] -= 1
@@ -75,7 +73,7 @@ class PPOPolicy:
             self.W1 -= self.lr * grad_W1_total
 
         if len(self.strategy_emb) > 500:
-            self.strategy_emb = dict(list(self.strategy_emb.items())[-300:])
+            self.strategy_emb = dict(list(self.strategy_emb.items())[-400:])
 
 class StrategyMemory:
     def __init__(self, generator=None):
@@ -102,14 +100,24 @@ class StrategyMemory:
     def evolve(self):
         if len(self.data) < 2 or self.generator is None: return
         top = sorted(self.data.items(), key=lambda x: x[1]["success"]/(x[1]["success"]+x[1]["fail"]), reverse=True)[:3]
-        prompt = f"基于以下策略生成3个更具体的Python修复动作：{[s for s,_ in top]}。输出JSON格式：{{\"strategies\":[\"...\"]}}"
+        prompt = f"""基于以下高成功率策略生成3个更具体的Python修复动作：
+{[s for s,_ in top]}
+
+要求：
+1. 生成的策略必须具体、可操作
+2. 必须考虑代码安全性和稳定性
+3. 策略应针对常见Python错误类型
+4. 输出严格JSON格式：{{"strategies":["策略1","策略2","策略3"]}}
+
+请确保生成的策略质量高、针对性强且安全可靠。"""
         try:
             raw = self.generator.generate(prompt)
             data = self.generator.parse_json(raw)
             for s in data.get("strategies", []):
                 if isinstance(s, str) and len(s) < 50 and s not in self.data:
                     self.data[s] = {"success": 1, "fail": 1}
-        except: pass
+        except Exception as e:
+            print(f"策略进化失败: {e}")
 
     def save(self):
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
@@ -132,18 +140,51 @@ class CodeGenerator:
         return resp.json()["response"]
 
     def is_safe(self, code, cmd):
-        combined = (code + " " + cmd).lower()
+        code_lower = code.lower()
+        cmd_lower = cmd.lower()
+        
+        # 检查代码中的危险模式
         for pattern in DANGER_PATTERNS:
-            if re.search(pattern, combined, re.I):
-                return False, pattern
+            if re.search(pattern, code_lower, re.I):
+                return False, f"代码中包含危险模式: {pattern}"
+        
+        # 检查命令中的危险模式
+        for pattern in DANGER_PATTERNS:
+            if re.search(pattern, cmd_lower, re.I):
+                return False, f"命令中包含危险模式: {pattern}"
+        
         return True, None
 
     def parse_json(self, text):
-        # 针对 R1 的加固：匹配最后一个 JSON 块，并移除可能存在的 Markdown 标记
         text = re.sub(r"```json|```", "", text)
-        matches = re.findall(r"\{.*\}", text, re.S)
-        if not matches: raise ValueError("未找到JSON")
-        return json.loads(matches[-1].strip())
+        json_objects = []
+        stack = []
+        start_idx = -1
+        
+        for i, c in enumerate(text):
+            if c == '{':
+                if not stack:
+                    start_idx = i
+                stack.append(c)
+            elif c == '}' and stack:
+                stack.pop()
+                if not stack:
+                    json_objects.append(text[start_idx:i+1])
+        
+        if json_objects:
+            try:
+                return json.loads(json_objects[-1])
+            except:
+                pass
+        
+        matches = re.findall(r'\{[^{}]*\}', text)
+        if matches:
+            try:
+                return json.loads(matches[-1])
+            except:
+                pass
+        
+        raise ValueError("无法解析JSON")
 
     def get_state(self, err, code, step):
         return np.array([
@@ -152,7 +193,8 @@ class CodeGenerator:
         ])
 
     def compute_reward(self, success, log, code):
-        if success: return 2.0 + min(len(code)/500, 0.5)
+        if success: 
+            return 2.0 + min(len(code)/500, 0.5) + (0.5 if "安全" in log else 0)
         r = -1.0
         if "Security Violation" in log: r -= 2.0
         if "SyntaxError" in log: r -= 0.5
@@ -197,10 +239,10 @@ class CodeGenerator:
 
                 if success:
                     print(f"任务成功！结果：\n{log}")
-                    break
-
-                print(f"失败，尝试策略: {strategy}")
-                current_prompt = f"需求：{self.user_description}\n当前错误：{log}\n代码：\n{code}\n请根据策略“{strategy}”修复并重新输出JSON。"
+                    # 不再立即终止训练
+                else:
+                    print(f"失败，尝试策略: {strategy}")
+                    current_prompt = f"需求：{self.user_description}\n当前错误：{log}\n代码：\n{code}\n请根据策略“{strategy}”修复并重新输出JSON。"
 
             except Exception as e:
                 print(f"运行异常: {e}")
@@ -214,3 +256,5 @@ if __name__ == "__main__":
     task = "写一个Python脚本，实现两个数相加"
     gen = CodeGenerator(task)
     gen.run_auto_coder()
+
+
