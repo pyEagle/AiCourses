@@ -29,7 +29,7 @@ class Memory:
         self.embed = SimpleEmbedding()
         self.data = self.load()
 
-        self.dim = 384  # MiniLM维度
+        self.dim = len(self.embed.vectorize("test"))
         self.index = self.load_faiss()
 
         self.max_size = 50
