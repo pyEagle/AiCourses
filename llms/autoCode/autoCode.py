@@ -8,11 +8,11 @@ import numpy as np
 MEMORY_FILE = "strategy_memory.json"
 
 DANGER_PATTERNS = [
-    r"os\.remove", r"os\.unlink", r"os\.rmdir", r"os\.removedirs", r"shutil\.rmtree", 
+    r"os\.remove", r"os\.unlink", r"os\.rmdir", r"os\.removedirs", r"shutil\.rmtree",
     r"os\.system", r"subprocess\.", r"pty\.spawn",
     r"rm\s+", r"mkfs", r"dd\s+", r"> /dev/",
-    r"__import__\(['\"]os['\"]\)\.system",
-    r"eval\(", r"exec\("
+    r"eval\(", r"exec\(",
+    r"__import__", r"getattr", r"Popen", r"system\("
 ]
 
 class PPOPolicy:
@@ -48,37 +48,51 @@ class PPOPolicy:
         if len(rewards) > 1:
             advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         else:
-            advantages = rewards 
+            advantages = rewards
 
         for s, strategies, a, old_p, adv in zip(states, strategies_list, actions, old_probs, advantages):
             probs, h = self.forward(s, strategies)
             p = probs[a]
             ratio = p / (old_p + 1e-8)
-            clipped = np.clip(ratio, 1 - self.eps_clip, 1 + self.eps_clip)
-            loss = -np.minimum(ratio * adv, clipped * adv)
+
+            # ✅ 标准 PPO Clip 逻辑实现
+            surr1 = ratio * adv
+            surr2 = np.clip(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * adv
+            
+            # 如果 surr1 超过了截断限制且对 loss 的贡献不再增加，则跳过此步梯度
+            if surr1 > surr2:
+                continue
 
             grad_logits = probs.copy()
             grad_logits[a] -= 1
-            
+
             grad_W1_total = np.zeros_like(self.W1)
-            
             for i, st in enumerate(strategies):
                 emb = self.get_strategy_emb(st)
-                grad = grad_logits[i] * loss
+                # 梯度方向基于优势函数 adv
+                grad = grad_logits[i] * adv 
                 
+                # 更新策略 Embedding
                 self.strategy_emb[st] -= self.lr * grad * h
-                
+                # 聚合 W1 梯度
                 grad_W1_total += np.outer(s, (1 - h**2) * emb * grad)
 
+            # 统一更新 W1，避免梯度污染
             self.W1 -= self.lr * grad_W1_total
+
+        # 内存管理
+        if len(self.strategy_emb) > 500:
+            self.strategy_emb = dict(list(self.strategy_emb.items())[-300:])
 
 class StrategyMemory:
     def __init__(self, generator=None):
         self.data = {}
         self.generator = generator
         if os.path.exists(MEMORY_FILE):
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
+            try:
+                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+            except: self.data = {}
 
     def get_weight(self, strategy):
         stat = self.data.get(strategy, {"success": 1, "fail": 1})
@@ -93,15 +107,15 @@ class StrategyMemory:
             self.data[strategy]["fail"] += 1
 
     def evolve(self):
-        if len(self.data) < 2 or self.generator is None:
-            return
+        if len(self.data) < 2 or self.generator is None: return
         top = sorted(self.data.items(), key=lambda x: x[1]["success"]/(x[1]["success"]+x[1]["fail"]), reverse=True)[:3]
-        prompt = f"基于这些成功策略生成3个更具体的Python修复策略：{[s for s,_ in top]}。输出JSON: {{\"strategies\":[\"...\",\"...\"]}}"
+        prompt = f"基于以下策略生成3个更具体的Python修复动作：{[s for s,_ in top]}。输出JSON格式：{{\"strategies\":[\"...\"]}}"
         try:
             raw = self.generator.generate(prompt)
             data = self.generator.parse_json(raw)
             for s in data.get("strategies", []):
-                if s not in self.data: self.data[s] = {"success": 1, "fail": 1}
+                if isinstance(s, str) and len(s) < 50 and s not in self.data:
+                    self.data[s] = {"success": 1, "fail": 1}
         except: pass
 
     def save(self):
@@ -120,114 +134,90 @@ class CodeGenerator:
     def generate(self, prompt):
         resp = requests.post(self.ollama_url, json={
             "model": self.model_name, "prompt": prompt, "stream": False,
-            "options": {"temperature": 0.2} # 稍微降低温度提高稳定性
+            "options": {"temperature": 0.2}
         }, timeout=120)
         return resp.json()["response"]
 
     def is_safe(self, code, cmd):
-        combined = code + " " + cmd
+        combined = (code + " " + cmd).lower()
         for pattern in DANGER_PATTERNS:
             if re.search(pattern, combined, re.I):
                 return False, pattern
         return True, None
 
-    def run(self, cmd):
-        try:
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
-            return res.returncode == 0, res.stdout + res.stderr
-        except Exception as e:
-            return False, str(e)
-
     def parse_json(self, text):
-        match = re.search(r"\{.*\}", text, re.S)
-        if match: return json.loads(match.group())
-        raise ValueError("LLM 未返回有效 JSON")
+        # 针对 R1 的加固：匹配最后一个 JSON 块，并移除可能存在的 Markdown 标记
+        text = re.sub(r"```json|```", "", text)
+        matches = re.findall(r"\{.*\}", text, re.S)
+        if not matches: raise ValueError("未找到JSON")
+        return json.loads(matches[-1].strip())
 
     def get_state(self, err, code, step):
         return np.array([
             "SyntaxError" in err, "NameError" in err, "ImportError" in err,
-            min(len(code)/1000, 1.0), step / 5.0
+            min(len(code)/2000, 1.0), step / 5.0
         ])
 
+    def compute_reward(self, success, log, code):
+        if success: return 2.0 + min(len(code)/500, 0.5)
+        r = -1.0
+        if "Security Violation" in log: r -= 2.0
+        if "SyntaxError" in log: r -= 0.5
+        return r
+
     def run_auto_coder(self, max_steps=5):
-        current_prompt = f"""
-需求：{self.user_description}
-请生成Python代码。必须严格按JSON格式输出，不要输出解释文字，不要Markdown块：
-{{
-  "path": "./out",
-  "main": "python ./out/main.py",
-  "files": [ {{ "path": "./out/main.py", "code": "..." }} ]
-}}
-"""
+        current_prompt = f"任务：{self.user_description}\n必须输出JSON，格式如下：\n{{\"path\":\"./out\",\"main\":\"python ./out/main.py\",\"files\":[{{\"path\":\"./out/main.py\",\"code\":\"...\"}}]}}"
+        
         states, actions, old_probs, rewards, strategies_list = [], [], [], [], []
 
         for step in range(max_steps):
-            print(f"\n--- 步骤 {step+1} ---")
+            print(f"\n--- 迭代步数 {step+1} ---")
             try:
                 raw = self.generate(current_prompt)
                 data = self.parse_json(raw)
-                file_info = data["files"][0]
-                current_code = file_info["code"]
-                exec_cmd = data["main"]
+                f_info = data["files"][0]
+                code, cmd = f_info["code"], data["main"]
 
                 # 安全审计
-                safe, reason = self.is_safe(current_code, exec_cmd)
+                safe, reason = self.is_safe(code, cmd)
                 if not safe:
-                    print(f"安全拦截：检测到危险模式 [{reason}]")
-                    log = f"Security Violation: Forbidden pattern '{reason}' detected."
-                    success = False
+                    success, log = False, f"Security Violation: {reason}"
                 else:
-                    target_path = file_info["path"]
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    with open(target_path, "w", encoding="utf-8") as f:
-                        f.write(current_code)
-                    success, log = self.run(exec_cmd)
+                    os.makedirs(os.path.dirname(f_info["path"]), exist_ok=True)
+                    with open(f_info["path"], "w", encoding="utf-8") as fp:
+                        fp.write(code)
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+                    success, log = (res.returncode == 0), res.stdout + res.stderr
 
-                state = self.get_state(log, current_code, step)
-                all_strategies = sorted(list(set(self.base_strategies) | set(self.memory.data.keys())))
-                weights = np.array([self.memory.get_weight(s) for s in all_strategies])
-                action, prob = self.policy.sample(state, all_strategies, weights)
-                strategy = all_strategies[action]
-
-                reward = 2.0 if success else -1.0
+                # RL 状态提取与采样
+                state = self.get_state(log, code, step)
+                all_st = sorted(list(set(self.base_strategies) | set(self.memory.data.keys())))
+                weights = np.array([self.memory.get_weight(s) for s in all_st])
+                idx, prob = self.policy.sample(state, all_st, weights)
+                
+                strategy = all_st[idx]
+                reward = self.compute_reward(success, log, code)
                 self.memory.update(strategy, success)
                 
-                states.append(state); strategies_list.append(all_strategies)
-                actions.append(action); old_probs.append(prob); rewards.append(reward)
+                states.append(state); strategies_list.append(all_st)
+                actions.append(idx); old_probs.append(prob); rewards.append(reward)
 
                 if success:
-                    print("任务达成！")
+                    print(f"任务成功！结果：\n{log}")
                     break
-                
-                print(f"尝试失败，应用策略: {strategy}")
-                current_prompt = f"""
-需求：{self.user_description}
-当前代码：
-{current_code}
-运行错误：
-{log}
-修复策略：{strategy}
 
-请修复并继续以JSON格式输出。
-"""
+                print(f"失败，尝试策略: {strategy}")
+                current_prompt = f"需求：{self.user_description}\n当前错误：{log}\n代码：\n{code}\n请根据策略“{strategy}”修复并重新输出JSON。"
+
             except Exception as e:
-                print(f"发生错误: {e}")
+                print(f"运行异常: {e}")
                 break
 
-        # 统一训练
-        if states: 
-            self.policy.update(states, strategies_list, actions, old_probs, rewards)
-        
-        self.memory.evolve()
-        self.memory.save()
-        return (data if 'data' in locals() else None), (log if 'log' in locals() else "未执行")
+        if states: self.policy.update(states, strategies_list, actions, old_probs, rewards)
+        self.memory.evolve(); self.memory.save()
+        return (data if 'data' in locals() else None), (log if 'log' in locals() else "未运行")
 
 if __name__ == "__main__":
-    req = "写一个简单的Python脚本，计算 1 到 100 的总和并打印"
-    gen = CodeGenerator(req)
-    final_out, final_log = gen.run_auto_coder()
-    
-    if final_out:
-        print("\n[最终代码路径]:", final_out["files"][0]["path"])
-    print("\n[终端最后日志]:\n", final_log)
-
+    task = "写一个Python脚本，实现两个数相加"
+    gen = CodeGenerator(task)
+    gen.run_auto_coder()
