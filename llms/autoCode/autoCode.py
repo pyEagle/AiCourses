@@ -1,238 +1,267 @@
-import json
 import os
+import json
 import subprocess
 import requests
+import numpy as np
 import re
 import math
 import random
-import faiss
-import numpy as np
-
+import ast
 from sentence_transformers import SentenceTransformer
 
-MEMORY_FILE = "memory.json"
-FAISS_INDEX_FILE = "faiss.index"
+DIM = 384
+MCTS_ITERS = 20
+MAX_CHILDREN = 3
+TIMEOUT = 5
+MAX_TESTS = 20
+RIDGE = 1e-6 
 
-correct_example = '{"path": "./", "files": [{"code": "print(1+2)", "pyfile": "test.py"}], "main": "python test.py"}'
+class Embedding:
+    def __init__(self):
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
+    def encode(self, text):
+        v = np.array(self.model.encode(text)).astype("float32")
+        return v / (np.linalg.norm(v) + 1e-10)
 
-class SimpleEmbedding:
-    def __init__(self):
-        self.model = SentenceTransformer("BAAI/bge-m3")
+class Thompson:
+    def __init__(self, dim):
+        self.A = np.eye(dim)
+        self.b = np.zeros((dim, 1))
 
-    def vectorize(self, text):
-        return np.array(self.model.encode(text)).astype("float32")
+    def sample_theta(self):
+        A_inv = np.linalg.pinv(self.A + RIDGE * np.eye(self.A.shape[0]))
+        mu = A_inv @ self.b
+        cov = A_inv
+        return np.random.multivariate_normal(mu.flatten(), cov)
 
+    def score(self, x):
+        theta = self.sample_theta()
+        return float(np.dot(theta, x))
 
-class Memory:
-    def __init__(self):
-        self.embed = SimpleEmbedding()
-        self.data = self.load()
+    def update(self, x, r):
+        x = x.reshape(-1, 1)
+        self.A += x @ x.T
+        self.b += r * x
 
-        self.dim = len(self.embed.vectorize("test"))
-        self.index = self.load_faiss()
+class ASTMutator:
+    def mutate(self, code):
+        try:
+            tree = ast.parse(code)
+        except:
+            return None
 
-        self.max_size = 50
+        class Transformer(ast.NodeTransformer):
+            def visit_Constant(self, node):
+                if isinstance(node.value, (int, float)):
+                    return ast.copy_location(
+                        ast.Constant(node.value + random.uniform(-1, 1)),
+                        node
+                    )
+                return node
 
-    def load(self):
-        if not os.path.exists(MEMORY_FILE):
-            return []
-        with open(MEMORY_FILE, "r") as f:
-            return json.load(f)
+        new_tree = Transformer().visit(tree)
+        try:
+            return ast.unparse(new_tree)
+        except:
+            return None
 
-    def save(self):
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+class Node:
+    def __init__(self, code, parent=None):
+        self.code = code
+        self.parent = parent
+        self.children = []
+        self.visits = 0
+        self.value = 0
 
-    def load_faiss(self):
-        if os.path.exists(FAISS_INDEX_FILE):
-            return faiss.read_index(FAISS_INDEX_FILE)
-        return faiss.IndexFlatIP(self.dim)  # 余弦相似度（需归一化）
+class MultiAgentMCTS:
+    def __init__(self, task):
+        self.task = task
+        self.embed = Embedding()
+        self.bandit = Thompson(DIM)
+        self.mutator = ASTMutator()
+        self.ollama = "http://localhost:11434/api/generate"
 
-    def save_faiss(self):
-        faiss.write_index(self.index, FAISS_INDEX_FILE)
+        self.tests = self.init_tests()
 
-    def normalize(self, v):
-        return v / np.linalg.norm(v)
+    def call_llm(self, prompt):
+        try:
+            r = requests.post(self.ollama, json={
+                "model": "deepseek-r1:latest",
+                "prompt": prompt,
+                "stream": False
+            }, timeout=60)
+            return r.json().get("response", "")
+        except:
+            return ""
 
-    def add_case(self, task, code, success):
-        v = self.normalize(self.embed.vectorize(task))
+    def safe_json(self, text):
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
 
-        self.data.append({
-            "task": task,
-            "code": code,
-            "success": 1 if success else 0,
-            "fail": 0 if success else 1,
-            "count": 1
-        })
+        matches = re.findall(r"\{.*?\}", text, re.S)
+        for m in reversed(matches):
+            try:
+                return json.loads(m)
+            except:
+                continue
+        return None
 
-        self.index.add(np.array([v]))
+    def init_code(self):
+        prompt = f"任务:{self.task}\n输出JSON代码"
+        out = self.safe_json(self.call_llm(prompt))
+        if out and "files" in out:
+            return "\n".join(f["code"] for f in out["files"])
+        return "print('BMI')"
 
-        self.clean()
-        self.save()
-        self.save_faiss()
+    def mutate_llm(self, code):
+        prompt = f"优化或修复代码:\n{code}\n返回JSON"
+        out = self.safe_json(self.call_llm(prompt))
+        if out and "files" in out:
+            return "\n".join(f["code"] for f in out["files"])
+        return None
 
-    def clean(self):
-        if len(self.data) <= self.max_size:
-            return
-
-        def score(x):
-            return (x["success"] / (x["success"] + x["fail"] + 1)) * math.log(1 + x["count"])
-
-        self.data.sort(key=score, reverse=True)
-
-        # 截断数据
-        self.data = self.data[:self.max_size]
-
-        # 重建 FAISS
-        self.rebuild_index()
-
-    def rebuild_index(self):
-        self.index = faiss.IndexFlatIP(self.dim)
-
-        vectors = []
-        for item in self.data:
-            v = self.normalize(self.embed.vectorize(item["task"]))
-            vectors.append(v)
-
-        if vectors:
-            self.index.add(np.array(vectors))
-
-    def retrieve(self, task, top_k=2):
-        if not self.data:
-            return []
-
-        v = self.normalize(self.embed.vectorize(task)).reshape(1, -1)
-
-        D, I = self.index.search(v, min(top_k, len(self.data)))
-
-        results = []
-        for idx in I[0]:
-            if idx < len(self.data):
-                results.append(self.data[idx])
-
-        return results
-
-
-class CodeGenerator:
-    def __init__(self, user_description):
-        self.user_description = user_description
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.memory = Memory()
-
-        self.error_prompt = "用户需求: {}\n错误信息: {}\n请修复代码并输出JSON。示例: {}"
-
-        self.dangerous_patterns = [
-            r"rm\s+-rf\s+\/",
-            r"rm\s+-rf\s+\*",
-            r"os\.system\(.+rm\s+-rf.+\)",
-            r"subprocess\..*\(.+rm\s+-rf.+\)",
-            r"shutil\.rmtree",
-            r"os\.remove\(",
-            r"os\.unlink\(",
-            r"eval\(",
-            r"exec\("
-        ]
-
-    def is_dangerous_code(self, code_text):
-        for pattern in self.dangerous_patterns:
-            if re.search(pattern, code_text):
-                return True, pattern
-        return False, None
-
-    def enhance_prompt(self, base_prompt):
-        cases = self.memory.retrieve(self.user_description)
-
-        if not cases:
-            return base_prompt
-
-        hint = "\n【历史经验】\n"
-        for c in cases:
-            hint += f"任务: {c['task']}\n代码:\n{c['code']}\n"
-
-        return base_prompt + hint
-
-    def call_llm(self, prompt):
-        payload = {
-            "model": "deepseek-r1:latest",
-            "prompt": prompt,
-            "format": "json",
-            "stream": False
-        }
-        r = requests.post(self.ollama_url, json=payload)
-        return r.json().get("response", "")
-
-    def run_code(self, cmd):
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return r.returncode == 0, r.stdout + r.stderr
-
-    def debug_code(self, error):
-        prompt = self.error_prompt.format(self.user_description, error, correct_example)
-        return self.call_llm(prompt)
-
-    def fix_and_retry(self, prompt, max_retries=5):
-        prompt = self.enhance_prompt(prompt)
-
-        for i in range(max_retries):
-            print("尝试:", i + 1)
-
-            raw = self.call_llm(prompt)
-
-            try:
-                out = json.loads(raw)
-
-                code_text = "\n".join(f["code"] for f in out["files"])
-
-                dangerous, pattern = self.is_dangerous_code(code_text)
-                if dangerous:
-                    print(f"⚠️ 危险代码: {pattern}")
-                    self.memory.add_case(self.user_description, code_text, False)
-                    prompt = self.error_prompt.format(
-                        self.user_description,
-                        f"危险操作: {pattern}",
-                        correct_example
-                    )
-                    continue
-
-                for f in out["files"]:
-                    os.makedirs(out["path"], exist_ok=True)
-                    with open(os.path.join(out["path"], f["pyfile"]), "w") as fp:
-                        fp.write(f["code"])
-
-                ok, log = self.run_code(out["main"])
-
-                if ok:
-                    self.memory.add_case(self.user_description, code_text, True)
-                    return out, log
-                else:
-                    self.memory.add_case(self.user_description, code_text, False)
-                    prompt = self.enhance_prompt(self.debug_code(log))
-
-            except Exception as e:
-                prompt = self.error_prompt.format(self.user_description, str(e), correct_example)
-
-        raise Exception("失败")
-
-
-def main():
-    task = "写一个函数计算两个数相加并输出"
-
-    prompt = f"""
-角色：资深人工智能专家
-任务: {task}
-要求:
-1. Python
-2. JSON输出
-3. 可执行
-示例: {correct_example}
+    def critic_score(self, code):
+        prompt = f"""
+评估以下代码质量（正确性、鲁棒性、可读性），0~1分：
+{code}
+返回JSON: {{"score":0.0}}
 """
+        out = self.safe_json(self.call_llm(prompt))
+        if out and "score" in out:
+            try:
+                return float(out["score"])
+            except:
+                return 0.5
+        return 0.5
 
-    gen = CodeGenerator(task)
-    out, log = gen.fix_and_retry(prompt)
+    def breaker_tests(self, code):
+        prompt = f"""
+代码:
+{code}
+生成3个极端测试:
+{{"tests":[{{"input":"...","output":"..."}}]}}
+"""
+        out = self.safe_json(self.call_llm(prompt))
+        if out and "tests" in out:
+            self.tests.extend(out["tests"])
 
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-    print(log)
+        if len(self.tests) > MAX_TESTS:
+            self.tests = self.tests[-MAX_TESTS:]
+
+    def init_tests(self):
+        prompt = f"任务:{self.task}\n生成测试JSON"
+        out = self.safe_json(self.call_llm(prompt))
+
+        if out and "tests" in out and len(out["tests"]) > 0:
+            return out["tests"]
+
+        return [
+            {"input": "170 60\n", "output": "正常"},
+            {"input": "180 90\n", "output": "超重"}
+        ]
+
+    def execute(self, code):
+        try:
+            os.makedirs("out", exist_ok=True)
+            path = "out/main.py"
+
+            with open(path, "w") as f:
+                f.write(code)
+
+            passed = 0
+            for t in self.tests:
+                res = subprocess.run(
+                    ["python", path],
+                    input=t["input"] + "\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=TIMEOUT
+                )
+
+                if res.returncode != 0:
+                    print("ERR:", res.stderr)
+
+                if t["output"] in res.stdout:
+                    passed += 1
+
+            return passed / max(len(self.tests), 1)
+        except Exception as e:
+            print("EXEC ERROR:", e)
+            return 0
+
+    def score_node(self, node):
+        emb = self.embed.encode(node.code)
+
+        ts_score = self.bandit.score(emb)
+
+        uct = (node.value / (node.visits + 1e-6)) + \
+              math.sqrt(math.log(node.parent.visits + 1) / (node.visits + 1e-6))
+
+        return 0.7 * ts_score + 0.3 * uct
+
+    def select(self, node):
+        while node.children:
+            node = max(node.children, key=lambda c: self.score_node(c))
+        return node
+
+    def expand(self, node):
+        for _ in range(MAX_CHILDREN):
+            new_code = self.mutate_llm(node.code)
+            if not new_code:
+                new_code = self.mutator.mutate(node.code)
+
+            if new_code:
+                node.children.append(Node(new_code, node))
+
+    def simulate(self, node):
+        emb = self.embed.encode(node.code)
+
+        exec_reward = self.execute(node.code)
+        critic_reward = self.critic_score(node.code)
+
+        reward = 0.7 * exec_reward + 0.3 * critic_reward
+
+        if exec_reward < 1.0:
+            self.breaker_tests(node.code)
+
+        self.bandit.update(emb, reward)
+
+        return reward
+
+    def backprop(self, node, reward):
+        while node:
+            node.visits += 1
+            node.value += reward
+            node = node.parent
+
+    def run(self):
+        root = Node(self.init_code())
+
+        best_node = root
+        best_score = -1
+
+        for i in range(MCTS_ITERS):
+            print(f"\n=== Iter {i+1} ===")
+
+            leaf = self.select(root)
+            self.expand(leaf)
+
+            for c in leaf.children:
+                r = self.simulate(c)
+                print("reward:", r)
+
+                if r > best_score:
+                    best_score = r
+                    best_node = c
+
+                self.backprop(c, r)
+
+        print("\n🏆 Best Code:\n")
+        print(best_node.code)
 
 
 if __name__ == "__main__":
-    main()
+    task = "创建一个函数，计算两个数的和，并在test.py中调用它。"
+    agent = MultiAgentMCTS(task)
+    agent.run()
+
