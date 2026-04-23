@@ -6,7 +6,7 @@ import re
 
 correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
 
-fix_prompt = f"用户需求: {}\n错误信息: {}\n请输出包含必需字段的 JSON。正确示例: {}"
+fix_prompt = f"用户需求:{}\n上一次生成代码:{}\n错误信息:{}\n请输出包含必需字段的 JSON。正确示例:{}"
 class CodeGenerator:
     def __init__(self, user_description):
         self.user_description = user_description
@@ -88,11 +88,11 @@ class CodeGenerator:
                 if success:
                     return output, log
                 else:
-                    prompt = fix_prompt.format(self.user_description, log, correct_example)
+                    prompt = fix_prompt.format(self.user_description, code_output, log, correct_example)
             except json.JSONDecodeError:
-                prompt = fix_prompt.format(self.user_description, "", correct_example)
+                prompt = fix_prompt.format(self.user_description, code_output, "", correct_example)
             except Exception as e:
-                prompt = fix_prompt.format(self.user_description, e, correct_example)
+                prompt = fix_prompt.format(self.user_description, code_output, e, correct_example)
 
         raise Exception("❌ 达到最大重试次数，无法生成有效代码")
 
