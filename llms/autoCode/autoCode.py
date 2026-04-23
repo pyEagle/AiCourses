@@ -1,16 +1,17 @@
-import json
-import os
-import subprocess
-import requests
 import re
+import os
+import json
+import subprocess
+
+import requests
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 MEMORY_FILE = "strategy_memory.json"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[*] 运行设备: {device}")
 
 DANGER_PATTERNS = [
     r"os\.remove", r"os\.unlink", r"os\.rmdir", r"os\.removedirs",
@@ -219,7 +220,7 @@ class CodeGenerator:
                 float("NameError" in log),
                 float("ImportError" in log),
                 min(len(code)/2000, 1),
-                step/5
+                step/steps,
             ], dtype=np.float32)
 
             weights = [self.memory.get_weight(s) for s in strategies]
