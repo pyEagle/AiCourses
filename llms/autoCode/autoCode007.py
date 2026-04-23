@@ -14,14 +14,13 @@ class SemanticBanditCore:
     def __init__(self, capacity=15):
         self.arms = [] # List of dicts
         self.capacity = capacity
-        self.memory_path = "v4_bandit_memory.json"
+        self.memory_path = "bandit_memory.json"
         self._load()
 
     def _get_feature_vector(self, text):
         text = text.lower()
-        tokens = re.findall(r"\b(json|file|recursive|search|regex|sort|count|math|handle|exception)\b", text)
         ngrams = [text[i:i+3] for i in range(len(text)-3)]
-        return Counter(tokens + ngrams)
+        return Counter(ngrams)
 
     def _calculate_similarity(self, vec1, vec2):
         all_keys = set(vec1.keys()) | set(vec2.keys())
@@ -72,9 +71,6 @@ class SemanticBanditCore:
         return self.arms[np.argmax(samples)]["prompt"]
 
     def update_stats(self, arm_id, context, reward):
-        """
-        [V4 升级] 严格 Bernoulli 奖励更新
-        """
         for arm in self.arms:
             if arm["id"] == arm_id:
                 if context not in arm["history"]:
@@ -106,7 +102,7 @@ class SemanticBanditCore:
             except: pass
 
 class SecureRunner:
-    def __init__(self, root="./v4_sandbox"):
+    def __init__(self, root="./sandbox"):
         self.root = root
         os.makedirs(root, exist_ok=True)
 
@@ -142,7 +138,7 @@ class ResearchAgent:
         try:
             r = requests.post(self.api_url, json=payload, timeout=60)
             txt = r.json().get("response", "")
-            return re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+            return re.sub(r"</think>.*?</think>", "", txt, flags=re.DOTALL).strip()
         except: return ""
 
     def _get_context(self, log):
@@ -156,8 +152,7 @@ class ResearchAgent:
 
     def solve(self, iterations=5):
         current_prompt = (
-            f"Solve: {self.task}. Output JSON: {{\"path\":\"./\", \"files\":[{{\"code\":str, \"pyfile\":str}}], \"main\":str}}. "
-            "Write robust Python code."
+            f"解决任务：{self.task}。请输出JSON格式：{{\"path\":\"./\", \"files\":[{{\"code\":str, \"pyfile\":str}}], \"main\":str}}。编写健壮的Python代码。"
         )
         last_log = ""
 
@@ -186,13 +181,10 @@ class ResearchAgent:
             if success: return spec
 
             evo_prompt = (
-                f"Your last prompt failed. Task: {self.task}. Error: {last_log}. "
-                "Design a new system prompt that is CONCISE and avoids the previous error. "
-                "Constraint: No conversation, just the prompt text. Must maintain JSON output requirement."
+                f"你的上一个提示词失败了。任务：{self.task}。错误信息：{last_log}。请设计一个新的简洁系统提示词，避免之前的错误。要求：不要对话，只输出提示词文本。必须保持JSON输出要求。"
             )
             current_prompt = self._llm_query(evo_prompt, is_json=False, temp=0.7)
 
 if __name__ == "__main__":
-    agent = ResearchAgent("Write a python script that finds the largest prime number under 1000.")
+    agent = ResearchAgent("编写一个Python脚本，找出1000以内最大的质数。")
     agent.solve()
-
