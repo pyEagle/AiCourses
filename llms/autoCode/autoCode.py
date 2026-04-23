@@ -1,258 +1,119 @@
-import re
-import os
 import json
+import os
 import subprocess
-
 import requests
-import numpy as np
+import re
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
 
-MEMORY_FILE = "strategy_memory.json"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-DANGER_PATTERNS = [
-    r"os\.remove", r"os\.unlink", r"os\.rmdir", r"os\.removedirs",
-    r"shutil\.rmtree", r"os\.system", r"subprocess\.",
-    r"pty\.spawn", r"rm\s+", r"mkfs", r"dd\s+",
-    r"eval\(", r"exec\("
-]
-
-class PPOPolicy(nn.Module):
-    def __init__(self, state_dim, emb_dim=32, lr=1e-3):
-        super().__init__()
-        self.fc = nn.Linear(state_dim, emb_dim)
-        self.emb_dim = emb_dim
-        self.strategy_embs = nn.ParameterDict()
-        self.eps_clip = 0.2
-
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-
-    def init_strategies(self, strategies):
-        for s in strategies:
-            if s not in self.strategy_embs:
-                self.strategy_embs[s] = nn.Parameter(
-                    torch.randn(self.emb_dim, device=device) * 0.1
-                )
-
-    def forward(self, s, strategies):
-        h = torch.tanh(self.fc(s))  # [emb_dim]
-
-        emb_matrix = torch.stack([self.strategy_embs[s] for s in strategies])  # [N, emb]
-        logits = torch.matmul(emb_matrix, h)  # [N]
-
-        log_probs = F.log_softmax(logits, dim=0)
-        probs = torch.exp(log_probs)
-        return probs, log_probs
-
-    def sample(self, s_np, strategies, weights_np=None):
-        self.eval()
-        with torch.no_grad():
-            s = torch.from_numpy(s_np).float().to(device)
-            probs, log_probs = self.forward(s, strategies)
-
-            if weights_np is not None:
-                w = torch.tensor(weights_np, dtype=torch.float32, device=device)
-                probs = probs * (w + 0.1)
-                probs = probs / (probs.sum() + 1e-8)
-                log_probs = torch.log(probs + 1e-8)
-
-            dist = torch.distributions.Categorical(probs)
-            a = dist.sample()
-
-            return a.item(), log_probs[a].item()
-
-    def update(self, states, strategies, actions, old_log_probs, rewards):
-        self.train()
-
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-
-        if len(rewards) > 1:
-            adv = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        else:
-            adv = rewards
-
-        total_loss = 0
-
-        for i in range(len(states)):
-            s = torch.from_numpy(states[i]).float().to(device)
-            a = actions[i]
-            old_log_p = torch.tensor(old_log_probs[i], device=device).detach()
-            advantage = adv[i]
-
-            probs, log_probs = self.forward(s, strategies)
-
-            log_p = log_probs[a]
-            ratio = torch.exp(log_p - old_log_p)
-
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
-
-            total_loss += -torch.min(surr1, surr2)
-
-        if total_loss == 0:
-            return
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-        self.optimizer.step()
-
-
-class StrategyMemory:
-    def __init__(self):
-        self.data = {}
-        if os.path.exists(MEMORY_FILE):
-            try:
-                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except:
-                self.data = {}
-
-    def get_weight(self, s):
-        stat = self.data.get(s, {"success": 1, "fail": 1})
-        return stat["success"] / (stat["success"] + stat["fail"])
-
-    def update(self, s, success):
-        if s not in self.data:
-            self.data[s] = {"success": 1, "fail": 1}
-        if success:
-            self.data[s]["success"] += 1
-        else:
-            self.data[s]["fail"] += 1
-
-    def save(self):
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
-
-
+fix_prompt = f"用户需求: {}\n错误信息: {}\n请输出包含必需字段的 JSON。正确示例: {}"
 class CodeGenerator:
-    def __init__(self, task):
-        self.task = task
-        self.url = "http://localhost:11434/api/generate"
-        self.model = "deepseek-r1:latest"
+    def __init__(self, user_description):
+        self.user_description = user_description
+        self.ollama_url = "http://localhost:11434/api/generate" 
+        self.dangerous_operations = [
+            r'os\.remove\(.+\)',
+            r'os\.unlink\(.+\)',
+            r'shutil\.rmtree\(.+\)',
+            r'subprocess\.run\(["\']rm ["\'].*\)',
+            r'subprocess\.run\["rmdir ["\'].*\)',
+            r'os\.system\["rmdir ["\'].*\)'
+        ]
 
-        self.memory = StrategyMemory()
-        self.base_strategies = ["精准修复错误行", "补全缺失变量", "增加异常处理", "替换为更稳定写法"]
+    def generate_code(self, prompt):
+        payload = {
+            "model": "deepseek-r1:latest",
+            "prompt": prompt,
+            "format": "json",
+            "stream": False
+        }
+        response = requests.post(self.ollama_url, json=payload)
+        if response.status_code == 200:
+            return response.json().get("response", "")
+        else:
+            raise Exception(f"Ollama 调用失败: {response.text}")
 
-        self.policy = PPOPolicy(5).to(device)
+    def is_dangerous_code(self, code):
+        """检查代码是否包含危险操作"""
+        for pattern in self.dangerous_operations:
+            if re.search(pattern, code):
+                return True
+        return False
 
-    def generate(self, prompt):
-        try:
-            r = requests.post(self.url, json={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False
-            }, timeout=120)
-            return r.json()["response"]
-        except Exception as e:
-            return str(e)
+    def save_code(self, output):
+        path = output["path"]
+        for file in output["files"]:
+            if self.is_dangerous_code(file["code"]):
+                raise Exception("❌ 检测到危险操作：代码尝试删除系统文件")
+            
+            filename = os.path.join(path, file["pyfile"])
+            with open(filename, "w") as f:
+                f.write(file["code"])
+        return output["main"]
 
-    def parse_json(self, text):
-        text = re.sub(r"```json|```", "", text)
+    def run_code(self, main_command):
+        try:
+            result = subprocess.run(
+                main_command, shell=True, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print("✅ 代码执行成功")
+                return True, result.stdout
+            else:
+                print(f"❌ 代码执行失败:\n{result.stderr}")
+                return False, result.stderr
+        except Exception as e:
+            print(f"❌ 执行异常: {e}")
+            return False, str(e)
 
-        stack = []
-        start = None
+    def validate_output(self, output):
+        """验证输出是否包含必需的字段"""
+        required_fields = ["path", "files", "main"]
+        for field in required_fields:
+            if field not in output:
+                raise ValueError(f"生成的 JSON 缺少必需字段: '{field}'")
+        return True
 
-        for i, c in enumerate(text):
-            if c == '{':
-                if not stack:
-                    start = i
-                stack.append(c)
-            elif c == '}':
-                if stack:
-                    stack.pop()
-                    if not stack and start is not None:
-                        try:
-                            return json.loads(text[start:i+1])
-                        except:
-                            continue
+    def fix_and_retry(self, prompt, max_retries=5):
+        for i in range(max_retries):
+            print(f"尝试第 {i + 1} 次生成...")
+            code_output = self.generate_code(prompt)
+            try:
+                output = json.loads(code_output)
+                print(output)
+                print('--'*20)
+                self.validate_output(output)
+                main_command = self.save_code(output)
+                success, log = self.run_code(main_command)
+                if success:
+                    return output, log
+                else:
+                    prompt = fix_prompt.format(self.user_description, log, correct_example)
+            except json.JSONDecodeError:
+                prompt = fix_prompt.format(self.user_description, "", correct_example)
+            except Exception as e:
+                prompt = fix_prompt.format(self.user_description, e, correct_example)
 
-        raise ValueError("JSON解析失败")
+        raise Exception("❌ 达到最大重试次数，无法生成有效代码")
 
-    def is_safe(self, code):
-        for p in DANGER_PATTERNS:
-            if re.search(p, code, re.I):
-                return False
-        return True
-
-    def build_strategy_space(self):
-        return sorted(list(set(self.base_strategies) | set(self.memory.data.keys())))
-
-    def run_auto_coder(self, steps=5):
-        prompt = f"任务:{self.task}\n返回JSON格式"
-
-        strategies = self.build_strategy_space()
-        self.policy.init_strategies(strategies)
-
-        hist = {"s":[], "a":[], "p":[], "r":[]}
-
-        for step in range(steps):
-            print(f"\n[Step {step+1}]")
-
-            raw = self.generate(prompt)
-
-            try:
-                data = self.parse_json(raw)
-                code = data["files"][0]["code"]
-                cmd = data["main"]
-            except Exception as e:
-                print("解析失败:", e)
-                continue
-
-            if not self.is_safe(code):
-                success, log = False, "Security violation"
-            else:
-                with open("tmp.py", "w", encoding="utf-8") as f:
-                    f.write(code)
-
-                try:
-                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-                    success = res.returncode == 0
-                    log = res.stdout + res.stderr
-                except Exception as e:
-                    success, log = False, str(e)
-
-            state = np.array([
-                float("SyntaxError" in log),
-                float("NameError" in log),
-                float("ImportError" in log),
-                min(len(code)/2000, 1),
-                step/steps,
-            ], dtype=np.float32)
-
-            weights = [self.memory.get_weight(s) for s in strategies]
-
-            a, logp = self.policy.sample(state, strategies, weights)
-
-            reward = 2.0 if success else -1.0
-            if "SyntaxError" in log:
-                reward -= 0.5
-            if "Security" in log:
-                reward -= 1.0
-
-            self.memory.update(strategies[a], success)
-
-            hist["s"].append(state)
-            hist["a"].append(a)
-            hist["p"].append(logp)
-            hist["r"].append(reward)
-
-            if success:
-                print("成功:", log)
-                break
-            else:
-                print("失败:", log[:80])
-                prompt = f"原任务:{self.task}\n错误:{log}\n代码:\n{code}\n使用策略【{strategies[a]}】修复"
-
-        if hist["s"]:
-            self.policy.update(hist["s"], strategies, hist["a"], hist["p"], hist["r"])
-
-        self.memory.save()
-
+def main():
+    input_str = "创建一个函数，计算两个数的和，并在test.py中调用它。"
+    prompt = f"""
+角色：你是一位资深软件开发工程师，在这个领域深耕20年了。
+背景：开发一个根据用户需求，自动生成完整可执行代码
+功能：{input_str}
+要求：1.所有代码必须是python写的，且完整可执行
+      2.结构化输出，参考用例 {correct_example}
+      3.执行python test.py，输出测试效果
+      4.如果报错，将错误信息给deepseek-r1:latest， deepseek-r1:latest再次按照2.结构化输出，直到代码运行成功，且实现了业务逻辑。
+输出：
+    1.实现功能所需要的代码
+    2.结构化输出，参考用例 {correct_example}
+    """
+    generator = CodeGenerator(input_str)
+    final_output, result_log = generator.fix_and_retry(prompt)
+    print("最终输出:", json.dumps(final_output, indent=2))
+    print("执行结果:", result_log)
 
 if __name__ == "__main__":
-    gen = CodeGenerator("写一个Python脚本，计算1到100的和并打印")
-    gen.run_auto_coder()
+    main()
