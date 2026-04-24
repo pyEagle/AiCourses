@@ -1,15 +1,12 @@
 # -*- coding:utf-8 -*-
-
 import os
 import re
 import json
 import hashlib
 import traceback
 import subprocess
-
 import requests
 import torch
-
 from sentence_transformers import SentenceTransformer
 
 class SemanticBanditCore:
@@ -19,7 +16,7 @@ class SemanticBanditCore:
         self.memory_path = "bandit_memory.json"
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[System] Initialized on device: {self.device}")
+        print(f"🚀 [系统] 初始化设备: {self.device}")
         
         self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device=self.device)
         self._load()
@@ -104,22 +101,21 @@ class SemanticBanditCore:
                     for a in data:
                         a["vec"] = torch.tensor(a["vec"]).to(self.device)
                     self.arms = data
-            except Exception as e:
+            except:
                 traceback.print_exc()
 
 class SecureRunner:
     def __init__(self, root="./sandbox"):
         self.root = root
         os.makedirs(root, exist_ok=True)
-
-        self.not_safe_code_list = ["__import__('os').system", "subprocess.call", "pty.spawn"]
+        self.not_safe_code_list = ["__import__('os').system", "subprocess.call", "pty.spawn", "rm -rf"]
 
     def run(self, spec):
         try:
             for file_info in spec["files"]:
                 code = file_info["code"]
                 if any(x in code for x in self.not_safe_code_list):
-                    return False, "安全风险: 触发系统级调用"
+                    return False, "安全风险：检测到系统级调用屏蔽词。"
                 
                 with open(os.path.join(self.root, file_info["pyfile"]), "w", encoding="utf-8") as f:
                     f.write(code)
@@ -130,7 +126,7 @@ class SecureRunner:
             )
             return (res.returncode == 0), (res.stdout if res.returncode == 0 else res.stderr)
         except Exception as e:
-            return False, f"运行错误: {str(e)}"
+            return False, f"运行时错误: {str(e)}"
 
 class ResearchAgent:
     def __init__(self, task):
@@ -149,59 +145,72 @@ class ResearchAgent:
         if is_json: payload["format"] = "json"
         
         try:
-            r = requests.post(self.api_url, json=payload, timeout=60)
+            r = requests.post(self.api_url, json=payload, timeout=90)
             txt = r.json().get("response", "")
             return re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
         except: return ""
 
     def _get_context(self, log):
-        if not log: return "domain_code|err_none"
+        if not log: return "领域代码|错误_无"
         log_upper = log.upper()
-        if "JSON" in log_upper: err = "format"
-        elif "SYNTAX" in log_upper: err = "syntax"
-        elif "TIMEOUT" in log_upper: err = "timeout"
-        else: err = "logic"
-        return f"domain_code|err_{err}"
+        if "JSON" in log_upper: err = "格式错误"
+        elif "SYNTAX" in log_upper: err = "语法错误"
+        elif "TIMEOUT" in log_upper: err = "执行超时"
+        else: err = "逻辑错误"
+        return f"领域代码|错误_{err}"
 
     def run(self, iterations=5):
         current_prompt = (
-            f"任务：{self.task}。\n"
-            f"要求：输出严格的JSON格式：{{\"path\":\"./\", \"files\":[{{\"code\":str, \"pyfile\":str}}], \"main\":str}}。\n"
-            f"注意：Python代码要包含完整的逻辑，确保直接运行 main 字段的命令可以输出结果。"
+            f"角色：资深 Python 开发工程师\n"
+            f"当前任务：{self.task}\n"
+            f"输出要求：请直接输出一个合法的 JSON 对象，不要包含任何 Markdown 代码块格式。格式如下：\n"
+            f"{{\"path\":\"./\", \"files\":[{{\"code\":\"Python代码字符串\", \"pyfile\":\"文件名.py\"}}], \"main\":\"运行主文件的shell命令\"}}\n"
+            f"核心原则：代码必须逻辑完整、自包含，确保执行 main 中的命令能直接得出结果。"
         )
         last_log = ""
+        last_failed_code = ""
 
         for i in range(iterations):
             ctx = self._get_context(last_log)
             arm_id = self.bandit.add_or_update_arm(current_prompt)
             selected_prompt = self.bandit.sample(ctx, fallback=current_prompt)
             
-            print(f"\n[轮次 {i+1}] Device: {self.bandit.device} | Arm: {arm_id}")
+            print(f"\n--- [第 {i+1} 轮迭代] Arm ID: {arm_id} ---")
             raw_res = self._llm_query(selected_prompt)
             
+            spec = {}
             try:
                 spec = json.loads(raw_res)
                 success, last_log = self.runner.run(spec)
-            except:
-                success, last_log = False, "JSON_Parse_Error"
+                last_failed_code = spec["files"][0]["code"] if spec.get("files") else ""
+            except Exception:
+                success, last_log = False, f"JSON解析失败。收到内容前100字: {raw_res[:100]}..."
+                last_failed_code = "无法获取代码（JSON解析错误）"
 
-            reward = 1.0 if success else (0.2 if "JSON_Parse_Error" not in last_log else 0.0)
+            reward = 1.0 if success else (0.3 if "JSON解析失败" not in last_log else 0.0)
             self.bandit.update_stats(arm_id, ctx, reward)
-            print(f"结果: {'成功' if success else '失败'} | 奖励: {reward:.1f}")
+            print(f"状态: {'✅ 运行成功' if success else '❌ 运行失败'} | 奖励得分: {reward:.1f}")
 
             if success:
-                print(f"\n 完成！输出：\n{last_log}")
+                print(f"\n✨ 任务圆满完成！\n程序输出结果：\n{last_log}")
                 return spec
 
-            # 提示词进化逻辑
+            print(f"💡 正在基于错误信息进化提示词...")
             evo_prompt = (
-                f"代码执行失败。任务是：{self.task}。\n"
-                f"错误：\n{last_log}\n"
-                f"请写一段新的系统提示词引导 AI 避开此错误并保持JSON格式输出。只输出文本。"
+                f"### 诊断与进化任务\n"
+                f"上一次尝试解决任务“{self.task}”失败了。\n\n"
+                f"### 失败的代码片段\n```python\n{last_failed_code}\n```\n\n"
+                f"### 错误反馈信息\n{last_log}\n\n"
+                f"### 提示词工程师指令\n"
+                f"你现在的身份是顶级提示词工程师。请完成以下步骤：\n"
+                f"1. 深刻分析代码失败的原因（是库缺失、逻辑漏洞、语法错误还是环境问题？）。\n"
+                f"2. 编写一段全新的、更具指导性的系统提示词（System Prompt），通过在指令中加入预警或详细规范，引导 AI 避开上述错误。\n"
+                f"3. 新提示词必须依然要求 AI 输出严格的 JSON 格式。\n"
+                f"4. 注意：请【仅输出】新的提示词文本内容，不要包含任何分析过程或开场白。"
             )
             current_prompt = self._llm_query(evo_prompt, is_json=False, temp=0.7)
 
 if __name__ == "__main__":
-    agent = ResearchAgent("编写一个Python脚本，找出1000以内最大的质数。")
+    agent = ResearchAgent("编写一个 Python 脚本，找出 1000 以内最大的质数。")
     agent.run()
 
