@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
+import tensorflow as tf
+
 np.random.seed(0)
 
 def myfun(x):
@@ -20,12 +22,12 @@ for i in range(len(y)-input_len-1):
     train_x.append(train_data)
     train_y.append((y[i+input_len+1]))
 
-import tensorflow as tf
 
 model = tf.keras.Sequential()
 model.add(tf.keras.layers.SimpleRNN(100, return_sequences=False, 
                     activation='relu',
                     input_shape=(input_len, 1)))
+
 ### 深度循环神经网络序列回归问题示例模型代码，运行时注释掉上面加层语句
 # model.add(tf.keras.layers.SimpleRNN(100, activation='relu',
 #                                     return_sequences=True,
