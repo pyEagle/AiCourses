@@ -4,9 +4,9 @@ import subprocess
 import requests
 import re
 
-correct_example = '{"path": "./", "files": [{"code": "def add(a, b):\\n    return a + b\\n", "pyfile": "test.py"}], "main": "python test.py"}'
+correct_example = '{"path": "./", "files": [{"code": "def print_str(): return "hello, word\n"", "pyfile": "test.py"}], "main": "python test.py"}'
 
-fix_prompt = f"用户需求:{}\n上一次生成代码:{}\n错误信息:{}\n请输出包含必需字段的 JSON。正确示例:{}"
+fix_prompt = "用户需求:{}\n上一次生成代码:{}\n错误信息:{}\n请输出包含必需字段的 JSON。正确示例:{}"
 class CodeGenerator:
     def __init__(self, user_description):
         self.user_description = user_description
