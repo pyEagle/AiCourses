@@ -22,9 +22,10 @@ def main():
         # 调用智能体
         try:
             answer = agent.chat(session_id, query)
-            print(f"智能体：{answer}\n")
+            print(f"============== 智能体：{answer}\n")
         except Exception as e:
             print(f"智能体：抱歉，处理你的问题时出错了：{str(e)}\n")
+        print('==============  finish current =======================')
 
 if __name__ == "__main__":
     main()

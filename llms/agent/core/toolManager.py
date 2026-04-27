@@ -1,10 +1,10 @@
-from tools.base_tool import BaseTool
-from tools.web_search_tool import WebSearchTool
+from tools.calculator import Calculator
 
 class ToolManager:
     def __init__(self):
+        # 注册所有工具
         self.tools = {
-            WebSearchTool().name: WebSearchTool()
+            Calculator().name: Calculator()
         }
 
     def get_all_tools(self):

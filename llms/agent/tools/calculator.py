@@ -1,8 +1,8 @@
 import math
 
-from skills.base_skill import BaseSkill
+from tools.baseTool import BaseTool
 
-class CalculatorSkill(BaseSkill):
+class Calculator(BaseTool):
     @property
     def name(self):
         return "calculator"
@@ -17,7 +17,7 @@ class CalculatorSkill(BaseSkill):
             "expression": "数学表达式（如：1+2*3、sqrt(16)）"
         }
 
-    def execute(self, **kwargs):
+    def call(self, **kwargs):
         if not self.check_parameters(**kwargs):
             return "参数错误，缺少数学表达式"
         
