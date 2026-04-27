@@ -22,6 +22,7 @@ REDIS_CONFIG = {
 KNOWLEDGE_CONFIG = {
     "faq_path": "./knowledge/faq.json",
     "model_file": "./model/bert-base-chinese/",
+    "docs_dir":"./docs/",
 }
 
 TOOL_CONFIG = {

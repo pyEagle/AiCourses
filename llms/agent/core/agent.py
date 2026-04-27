@@ -55,11 +55,16 @@ class Agent:
         return commands
 
     def chat(self, session_id, query):
-        knowledge_answer = self.knowledge.retrieve(query)
+        res, knowledge_answer = self.knowledge.retrieve(query)
         
         system_prompt = self._build_system_prompt()
         if knowledge_answer:
+            if res == 'qa':
+                self.memory.save_message(session_id, "user", query)
+                self.memory.save_message(session_id, "assistant", knowledge_answer)
+                return knowledge_answer
             prompt = f"知识库信息：\n{knowledge_answer}\n\n用户问题：{query}"
+            
         else:
             prompt = f"用户问题：{query}"
         
