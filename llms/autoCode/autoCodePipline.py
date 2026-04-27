@@ -9,6 +9,9 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 
+# ==========================================
+# 1. DAG执行器（不变）
+# ==========================================
 class DGARunner:
     def __init__(self, graph):
         self.nodes = graph["nodes"]
@@ -41,6 +44,9 @@ class DGARunner:
         return order
 
 
+# ==========================================
+# 2. Bandit（轻微增强：支持context）
+# ==========================================
 class SemanticBanditCore:
     def __init__(self, capacity=20):
         self.arms = []
@@ -64,15 +70,10 @@ class SemanticBanditCore:
 
     def add_or_update_arm(self, prompt):
         new_vec = self._get_feature_vector(prompt)
-        best_sim, best_arm = 0.0, None
 
         for arm in self.arms:
-            sim = self._calculate_similarity(new_vec, arm["vec"])
-            if sim > best_sim:
-                best_sim, best_arm = sim, arm
-
-        if best_sim > 0.85:
-            return best_arm["id"]
+            if self._calculate_similarity(new_vec, arm["vec"]) > 0.9:
+                return arm["id"]
 
         arm_id = hashlib.md5(prompt.encode()).hexdigest()[:8]
         self.arms.append({
@@ -94,15 +95,15 @@ class SemanticBanditCore:
         if not self.arms:
             return fallback
 
-        alphas = [arm["history"].get(context_key, [1.1, 1.1])[0] for arm in self.arms]
-        betas = [arm["history"].get(context_key, [1.1, 1.1])[1] for arm in self.arms]
+        scores = []
+        for arm in self.arms:
+            a, b = arm["history"].get(context_key, [1.1, 1.1])
+            sample = torch.distributions.Beta(
+                torch.tensor(a), torch.tensor(b)
+            ).sample().item()
+            scores.append(sample)
 
-        dist = torch.distributions.Beta(
-            torch.tensor(alphas, device=self.device),
-            torch.tensor(betas, device=self.device)
-        )
-
-        return self.arms[torch.argmax(dist.sample()).item()]["prompt"]
+        return self.arms[int(torch.argmax(torch.tensor(scores)))]["prompt"]
 
     def update_stats(self, arm_id, context, reward):
         for arm in self.arms:
@@ -110,173 +111,171 @@ class SemanticBanditCore:
                 if context not in arm["history"]:
                     arm["history"][context] = [1.1, 1.1]
                 arm["history"][context][0] += reward
-                arm["history"][context][1] += (1.0 - reward)
+                arm["history"][context][1] += (1 - reward)
                 arm["score"] = 0.7 * arm["score"] + 0.3 * reward
-                break
         self._save()
 
     def _save(self):
-        save_data = []
+        data = []
         for a in self.arms:
             temp = a.copy()
             temp["vec"] = temp["vec"].cpu().tolist()
-            save_data.append(temp)
-
-        with open(self.memory_path, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
+            data.append(temp)
+        with open(self.memory_path, "w") as f:
+            json.dump(data, f)
 
     def _load(self):
         if os.path.exists(self.memory_path):
-            try:
-                with open(self.memory_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+            with open(self.memory_path) as f:
+                data = json.load(f)
                 for a in data:
                     a["vec"] = torch.tensor(a["vec"]).to(self.device)
                 self.arms = data
-            except:
-                traceback.print_exc()
 
 
+# ==========================================
+# 3. 安全执行器（不变）
+# ==========================================
 class SecureRunner:
     def __init__(self, root="./sandbox"):
         self.root = root
         os.makedirs(root, exist_ok=True)
 
-    def run(self, spec):
+    def run(self, code):
         try:
-            for file_info in spec["files"]:
-                with open(os.path.join(self.root, file_info["pyfile"]), "w", encoding="utf-8") as f:
-                    f.write(file_info["code"])
+            path = os.path.join(self.root, "main.py")
+            with open(path, "w") as f:
+                f.write(code)
 
             res = subprocess.run(
-                spec["main"], shell=True, cwd=self.root,
-                capture_output=True, text=True, timeout=15
+                "python main.py",
+                shell=True,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=10
             )
-            return (res.returncode == 0), res.stdout if res.returncode == 0 else res.stderr
-
+            return res.returncode == 0, res.stdout if res.returncode == 0 else res.stderr
         except Exception as e:
             return False, str(e)
 
 
+# ==========================================
+# 4. 🔥 ResearchAgent（核心升级：反思+多轮）
+# ==========================================
 class ResearchAgent:
-    def __init__(self, task, custom_prompt_template=None):
+    def __init__(self, task):
         self.task = task
-        self.custom_prompt_template = custom_prompt_template
+        self.api_url = "http://localhost:11434/api/generate"
         self.bandit = SemanticBanditCore()
         self.runner = SecureRunner()
-        self.api_url = "http://localhost:11434/api/generate"
 
-    def _llm_query(self, prompt, is_json=True):
-        payload = {
+    def _llm(self, prompt):
+        r = requests.post(self.api_url, json={
             "model": "deepseek-r1:latest",
             "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.2}
-        }
-        if is_json:
-            payload["format"] = "json"
+            "stream": False
+        })
+        return r.json().get("response", "")
 
-        try:
-            r = requests.post(self.api_url, json=payload, timeout=120)
-            return r.json().get("response", "")
-        except:
-            return ""
+    def solve_node(self, node, context_input, max_retry=3):
+        context_key = f"{self.task}_{node}"
 
-    def run(self, iterations=3):
-        prompt = self.custom_prompt_template
+        base_prompt = f"""
+任务: {self.task}
+当前模块: {node}
+输入: {context_input}
 
-        for _ in range(iterations):
-            raw = self._llm_query(prompt)
-            try:
-                spec = json.loads(raw)
-                ok, out = self.runner.run(spec)
-                if ok:
-                    print("✅ 成功\n", out)
-                    return spec
-            except:
-                pass
+请写Python代码，只输出print最终结果
+"""
 
-        return None
+        arm_id = self.bandit.add_or_update_arm(base_prompt)
+        prompt = self.bandit.sample(context_key, base_prompt)
+
+        last_error = ""
+
+        for i in range(max_retry):
+            full_prompt = prompt + f"\n错误:{last_error}" if last_error else prompt
+
+            code = self._llm(full_prompt)
+
+            ok, out = self.runner.run(code)
+
+            if ok:
+                self.bandit.update_stats(arm_id, context_key, 1.0)
+                return out.strip()
+
+            else:
+                last_error = out
+                self.bandit.update_stats(arm_id, context_key, 0.0)
+
+        raise RuntimeError(f"节点失败: {node}")
 
 
+# ==========================================
+# 5. SSE（升级：逐节点执行）
+# ==========================================
 class SSEOrchestrator:
     def __init__(self, task):
         self.task = task
         self.api_url = "http://localhost:11434/api/generate"
 
-    def _llm_query(self, prompt):
-        payload = {
+    def _llm(self, prompt):
+        r = requests.post(self.api_url, json={
             "model": "deepseek-r1:latest",
             "prompt": prompt,
             "stream": False,
             "format": "json"
-        }
-        try:
-            r = requests.post(self.api_url, json=payload, timeout=120)
-            return r.json().get("response", "")
-        except:
-            return "{}"
+        })
+        return r.json().get("response", "{}")
 
-    def analyze_and_decompose(self):
+    def analyze(self):
         prompt = f"""
-拆解任务并构建DAG：
+拆解任务为DAG:
 
-任务：{self.task}
+{self.task}
 
-输出：
+输出:
 {{
-  "modules": [{{"name":"","desc":"","inputs":"","outputs":""}}],
-  "graph": {{
-    "nodes": [],
-    "edges": []
-  }}
+ "modules":[{{"name":""}}],
+ "graph":{{"nodes":[],"edges":[]}}
 }}
 """
-        res = self._llm_query(prompt)
-        return json.loads(res)
+        return json.loads(self._llm(prompt))
 
-    def assemble_and_execute(self, plan):
-        # 👉 DGA执行顺序
+    def execute(self, plan):
         dga = DGARunner(plan["graph"])
         order = dga.topo_sort()
 
-        modules_str = json.dumps(plan["modules"], ensure_ascii=False, indent=2)
+        agent = ResearchAgent(self.task)
 
-        prompt = f"""
-根据DGA生成代码：
+        memory = {}
 
-任务：{self.task}
+        for node in order:
+            print(f"\n🚀 执行节点: {node}")
 
-模块：
-{modules_str}
+            input_data = {k: memory[k] for k in memory}
 
-执行顺序：
-{order}
+            out = agent.solve_node(node, input_data)
 
-要求：
-1 严格按顺序执行
-2 上一函数输出作为下一函数输入
-3 生成main()
+            memory[node] = out
 
-只输出JSON
-"""
+            print("✅ 输出:", out)
 
-        agent = ResearchAgent(self.task, prompt)
-        return agent.run()
+        return memory
 
 
 # ==========================================
 # 6. 运行
 # ==========================================
 if __name__ == "__main__":
-    if os.path.exists("bandit_memory.json"):
-        os.remove("bandit_memory.json")
-
     task = "生成100个随机数，筛选质数，计算均值和方差"
 
     sse = SSEOrchestrator(task)
 
-    plan = sse.analyze_and_decompose()
-    print("🧠 SSE:", plan)
+    plan = sse.analyze()
+    print("🧠 DAG:", plan)
 
-    sse.assemble_and_execute(plan)
+    result = sse.execute(plan)
+
+    print("\n🏁 最终结果:", result)
