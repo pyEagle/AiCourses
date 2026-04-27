@@ -87,7 +87,6 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         s, a, r, s_, d = zip(*batch)
-        # 转换为张量并移动到指定设备
         return (torch.FloatTensor(np.array(s)).to(device),
                 torch.LongTensor(np.array(a)).to(device),
                 torch.FloatTensor(np.array(r)).to(device),
@@ -166,7 +165,7 @@ def train():
     return env, q_net, rewards_history
 
 def visualize_policy(env, q_net):
-    q_net.eval() # 切换到评估模式
+    q_net.eval()
     arrows = {0: '↑', 1: '↓', 2: '←', 3: '→'}
 
     fig, ax = plt.subplots(figsize=(8, 8))
