@@ -2,17 +2,18 @@
 
 import random
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
-
 
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# =====================
-# 1 GridWorld
-# =====================
 class GridWorld:
     def __init__(self, size=6):
         self.size = size
@@ -72,38 +73,33 @@ class GridWorld:
         s[idx] = 1.0
         return s
 
-
-# =====================
-# 2 Actor-Critic
-# =====================
-class ActorCritic(tf.keras.Model):
+class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.fc1 = tf.keras.layers.Dense(128, activation="relu")
-        self.fc2 = tf.keras.layers.Dense(128, activation="relu")
-        self.policy_head = tf.keras.layers.Dense(action_dim)
-        self.value_head = tf.keras.layers.Dense(1)
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.policy_head = nn.Linear(128, action_dim)
+        self.value_head = nn.Linear(128, 1)
 
-    def call(self, x):
-        x = self.fc1(x)
-        x = self.fc2(x)
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
         return self.policy_head(x), self.value_head(x)
 
-
-# =====================
-# 3 A2C
-# =====================
 class A2CAgent:
     def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99):
         self.gamma = gamma
-        self.model = ActorCritic(state_dim, action_dim)
-        self.optimizer = tf.keras.optimizers.Adam(lr)
+        self.model = ActorCritic(state_dim, action_dim).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
 
     def select_action(self, state):
-        logits, value = self.model(state[None, :])
-        probs = tf.nn.softmax(logits)
-        action = np.random.choice(len(probs[0]), p=probs.numpy()[0])
-        return action, value.numpy()[0, 0]
+        state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            logits, value = self.model(state_t)
+            probs = F.softmax(logits, dim=-1)
+        
+        action = np.random.choice(len(probs[0]), p=probs.cpu().numpy()[0])
+        return action, value.item()
 
     def update(self, states, actions, rewards, values, next_value, done):
         returns = []
@@ -113,38 +109,35 @@ class A2CAgent:
             R = r + self.gamma * R
             returns.insert(0, R)
 
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.int32)
-        returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-        values = tf.convert_to_tensor(values, dtype=tf.float32)
+        states_t = torch.tensor(np.array(states), dtype=torch.float32, device=device)
+        actions_t = torch.tensor(actions, dtype=torch.long, device=device)
+        returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
+        values_t = torch.tensor(values, dtype=torch.float32, device=device)
 
-        advantages = returns - values
+        advantages = (returns_t - values_t).detach()
 
-        with tf.GradientTape() as tape:
-            logits, value_preds = self.model(states)
-            value_preds = tf.squeeze(value_preds)
+        logits, value_preds = self.model(states_t)
+        value_preds = value_preds.squeeze()
 
-            policy_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels=actions,
-                logits=logits
-            )
-            policy_loss = tf.reduce_mean(policy_loss * tf.stop_gradient(advantages))
+        policy_loss = F.cross_entropy(logits, actions_t, reduction='none')
+        policy_loss = torch.mean(policy_loss * advantages)
 
-            value_loss = tf.reduce_mean(tf.square(returns - value_preds))
+        # Value Loss
+        value_loss = torch.mean(torch.square(returns_t - value_preds))
 
-            entropy = -tf.reduce_mean(
-                tf.nn.softmax(logits) * tf.nn.log_softmax(logits)
-            )
+        # Entropy Loss
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -torch.mean(torch.sum(probs * log_probs, dim=1))
 
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+        # 总 Loss
+        loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
 
-        grads = tape.gradient(loss, self.model.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        # 反向传播更新
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-
-# =====================
-# 4 训练
-# =====================
 env = GridWorld(size=6)
 agent = A2CAgent(env.state_dim, env.action_space)
 
@@ -168,16 +161,15 @@ for ep in range(EPISODES):
         if done:
             break
 
-    _, next_value = agent.model(state[None, :])
-    agent.update(states, actions, rewards, values, next_value.numpy()[0, 0], done)
+    state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        _, next_value = agent.model(state_t)
+    
+    agent.update(states, actions, rewards, values, next_value.item(), done)
 
     if ep % 50 == 0:
         print(f"Episode {ep:3d} | steps: {len(rewards)}")
 
-
-# =====================
-# 5 可视化
-# =====================
 def visualize_policy(env, agent):
     arrow = {0: "↑", 1: "↓", 2: "←", 3: "→"}
     grid = [["" for _ in range(env.size)] for _ in range(env.size)]
@@ -191,8 +183,10 @@ def visualize_policy(env, agent):
             else:
                 s = np.zeros(env.size * env.size, dtype=np.float32)
                 s[r * env.size + c] = 1.0
-                logits, _ = agent.model(s[None, :])
-                a = tf.argmax(logits, axis=1).numpy()[0]
+                s_t = torch.tensor(s[None, :], dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    logits, _ = agent.model(s_t)
+                a = torch.argmax(logits, dim=1).item()
                 grid[r][c] = arrow[a]
 
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -218,5 +212,6 @@ def visualize_policy(env, agent):
     ax.set_yticklabels([])
     plt.show()
 
+if __name__ == "__main__":
+    visualize_policy(env, agent)
 
-visualize_policy(env, agent)
