@@ -1,36 +1,39 @@
 import json
+import numpy as np
+
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 from config.settings import KNOWLEDGE_CONFIG
 
 class KnowledgeManger:
     def __init__(self):
-        self.faq_data = self._load_faq()
+        self.model = SentenceTransformer(KNOWLEDGE_CONFIG['model_file'])
+        self.faq_data, self.question_embeddings = self._load_faq()
 
     def _load_faq(self):
         try:
             with open(KNOWLEDGE_CONFIG["faq_path"], "r", encoding="utf-8") as f:
-                return json.load(f)
+                faq_data = json.load(f)
         except FileNotFoundError:
             print(f"FAQ文件未找到，路径：{KNOWLEDGE_CONFIG['faq_path']}")
-            return []
+            return [], []
         except json.JSONDecodeError:
             print("FAQ文件格式错误")
-            return []
+            return [], []
 
-    def retrieve(self, query):
+        questions = [item["question"] for item in faq_data]
+        question_embeddings = self.model.encode(questions)
+
+        return faq_data, question_embeddings
+
+    def retrieve(self, query, topK=2):
         if not self.faq_data:
             return ""
-        
-        # 简单的关键词匹配（可替换为向量检索等更优方案）
-        query_lower = query.lower()
-        matched = []
-        
-        for item in self.faq_data:
-            question = item.get("question", "").lower()
-            # 关键词匹配
-            if any(word in query_lower for word in question.split()):
-                matched.append(item.get("answer", ""))
-        
-        if matched:
-            return "\n\n".join(matched[:2])  # 返回前2个匹配结果
-        return ""
 
+        query_embedding = self.model.encode([query])[0].reshape(1, -1)
+
+        similarities = cosine_similarity(query_embedding, self.question_embeddings)[0]
+        top_indices = np.argsort(similarities)[-topK:][::-1]
+
+        matched = [self.faq_data[i]["answer"] for i in top_indices]
+        return "\n\n".join(matched)
