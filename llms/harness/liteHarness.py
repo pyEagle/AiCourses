@@ -29,7 +29,7 @@ class OllamaClient:
             result = response.json()
             return result.get("response", "")
         except Exception as e:
-            print(f"[Ollama ERROR] {e}")
+            print(f"[Ollama 错误] {e}")
             return ""
 
 
@@ -39,7 +39,7 @@ class Task:
         self.dataset = dataset
 
     def build_prompt(self, item):
-        return f"Q: {item['input']}\nA:"
+        return f"请直接给出结果。问题: {item['input']}\n答案:"
 
 
 class Evaluator:
@@ -50,6 +50,7 @@ class Evaluator:
         return int(pred.strip().lower() == target.strip().lower())
 
     def evaluate(self, preds, targets):
+        if not preds: return 0.0
         scores = [self.exact_match(p, t) for p, t in zip(preds, targets)]
         return sum(scores) / len(scores)
 
@@ -62,6 +63,8 @@ class Metrics:
         self.records.append(latency)
 
     def summary(self):
+        if not self.records:
+            return {"avg_latency": 0, "num_samples": 0}
         avg = sum(self.records) / len(self.records)
         return {
             "avg_latency": avg,
@@ -75,7 +78,7 @@ class Runner:
         self.evaluator = evaluator
 
     def run(self, task: Task):
-        print(f"\n[Runner] Running task: {task.name}")
+        print(f"\n[执行器] 正在运行任务: {task.name}")
 
         preds = []
         targets = []
@@ -93,22 +96,26 @@ class Runner:
             preds.append(pred)
             targets.append(item["target"])
 
-            print(f"\n--- Sample {idx} ---")
-            print(f"Prompt: {prompt}")
-            print(f"Pred: {pred}")
-            print(f"Target: {item['target']}")
-            print(f"Latency: {latency:.2f}s")
+            print(f"\n--- 样本 {idx} ---")
+            print(f"提示词: {prompt.replace('\n', ' ')}")
+            print(f"预测结果: {pred}")
+            print(f"标准答案: {item['target']}")
+            print(f"响应耗时: {latency:.2f}秒")
 
         acc = self.evaluator.evaluate(preds, targets)
         stat = metrics.summary()
 
-        print("\n[Result]")
-        print(f"Accuracy: {acc:.4f}")
-        print(f"Avg Latency: {stat['avg_latency']:.2f}s")
+        print("\n" + "="*30)
+        print(f"[任务评测完成: {task.name}]")
+        print(f"准确率: {acc:.4f}")
+        print(f"平均耗时: {stat['avg_latency']:.2f}秒")
+        print("="*30)
 
         return {
-            "accuracy": acc,
-            **stat
+            "任务名": task.name,
+            "准确率": acc,
+            "平均耗时": stat['avg_latency'],
+            "样本数": stat['num_samples']
         }
 
 
@@ -119,13 +126,12 @@ def build_demo_task():
         {"input": "3+5=?", "target": "8"},
         {"input": "10-3=?", "target": "7"},
     ]
-    return Task("Arithmetic", dataset)
+    return Task("基础算术评测", dataset)
 
 
 def main():
     device_manager = DeviceManager()
-
-    model = OllamaClient(model="deepseek:latest")
+    model = OllamaClient() 
     evaluator = Evaluator()
 
     runner = Runner(model, evaluator)
@@ -134,8 +140,8 @@ def main():
 
     result = runner.run(task)
 
-    print("\n[Final Result]")
-    print(json.dumps(result, indent=2))
+    print("\n[最终 JSON 统计结果]")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
