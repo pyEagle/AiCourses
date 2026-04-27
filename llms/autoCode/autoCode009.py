@@ -17,7 +17,7 @@ class SemanticBanditCore:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🚀 [系统] 初始化设备: {self.device}")
         try:
-            self.model = SentenceTransformer('/usr/songzs/model/LLms/sentence_transformers/', device=self.device)
+            self.model = SentenceTransformer('./model/LLms/sentence_transformers/', device=self.device)
         except:
             self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
         self._load()
