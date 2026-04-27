@@ -17,8 +17,8 @@ session_id = str(uuid.uuid4())
 # 1. 创建客户端实例
 ws_client = WSClient(
     WSClientOptions(
-        bot_id=os.getenv('WECHAT_BOT_ID', 'aib8kHIvLrO0tizx4SmBrb7_9jVzrq28Onw'),
-        secret=os.getenv('WECHAT_BOT_SECRET', 'EGxaEM5GlJ3FKvqCjO5ca1Qeo6fdDHpBpXSHBJeuIy3'),
+        bot_id=os.getenv('WECHAT_BOT_ID', 'your_WECHAT_BOT_ID'),
+        secret=os.getenv('WECHAT_BOT_SECRET', 'your_WECHAT_BOT_SECRET'),
     )
 )
 
