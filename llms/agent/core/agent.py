@@ -1,10 +1,10 @@
 import re
 
-from core.llm_client import OllamaClient
+from core.llmClient import OllamaClient
 from core.memory import RedisMemory
-from core.skill_manager import SkillManager
-from core.tool_manager import ToolManager
-from core.knowledge_base import KnowledgeBase
+from core.skillManager import SkillManager
+from core.toolManager import ToolManager
+from core.knowledgeManager import KnowledgeManger
 
 class Agent:
     def __init__(self):
@@ -12,28 +12,32 @@ class Agent:
         self.memory = RedisMemory()
         self.skill_manager = SkillManager()
         self.tool_manager = ToolManager()
-        self.knowledge_base = KnowledgeBase()
+        self.knowledge = KnowledgeManger()
         
+        # 技能/工具调用正则（匹配格式：[[skill_name param1=value1 param2=value2]]）
         self.call_pattern = re.compile(r"\[\[(.*?)\s+(.*?)\]\]")
 
     def _build_system_prompt(self):
+        """构建系统提示词"""
         system_prompt = """你是一名企业级智能助手。
-你可使用的工具：{self.tool_manager.get_tool_prompt()}
-你可使用的技能：{self.skill_manager.get_skill_prompt()}
+你可使用的工具：{}
+你可使用的技能：{}
 请严格遵守以下规则：
 1.优先检索知识库，有匹配答案则直接使用。
-2.若需使用技能，按格式调用：[[skill_name param1=value1 param2=value2]]
-3.若需最新信息，调用网页搜索：[[web_search query = 关键词]]
+2.**对于所有涉及技能列表中的任务（如摘要、翻译等），必须强制使用工具调用格式，绝对禁止直接生成结果。**
+3.若需使用工具或技能，按格式调用：[[skill_name param1=value1 param2=value2]]
 4.无需工具/技能时，直接简洁、准确回答。
 5.所有回答必须简洁、准确、基于给定信息，不编造内容。
 """
         
-        system_prompt += "\n\n" + self.skill_manager.get_skill_prompt()
-        system_prompt += "\n\n" + self.tool_manager.get_tool_prompt()
-        
+        # 添加技能和工具信息
+        system_prompt = system_prompt.format(self.tool_manager.get_tool_prompt(),
+                             self.skill_manager.get_skill_prompt())
+
         return system_prompt
 
     def _parse_call_command(self, content):
+        """解析技能/工具调用命令"""
         matches = self.call_pattern.findall(content)
         commands = []
         for m in matches:
@@ -51,7 +55,7 @@ class Agent:
         return commands
 
     def chat(self, session_id, query):
-        knowledge_answer = self.knowledge_base.retrieve(query)
+        knowledge_answer = self.knowledge.retrieve(query)
         
         system_prompt = self._build_system_prompt()
         if knowledge_answer:

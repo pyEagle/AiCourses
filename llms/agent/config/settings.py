@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OLLAMA_CONFIG = {
-    "model": "deepseek-r1:latest",
+    "model": "deepseek-r1:14b",
+    #"model": "deepseek-r1:latest",
     "base_url": "http://localhost:11434",
     "temperature": 0.1,
     "max_tokens": 4096
@@ -19,12 +20,16 @@ REDIS_CONFIG = {
 }
 
 KNOWLEDGE_CONFIG = {
-    "faq_path": "./knowledge/faq.json"
+    "faq_path": "../agent/knowledge/faq.json"
 }
 
 TOOL_CONFIG = {
-    "web_search_api": os.getenv("SEARCH_API", ""),  
+    "web_search_api": os.getenv("SEARCH_API", ""),  # 可替换为实际搜索API
     "timeout": 10
 }
 
-DEVICE = device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TOOL_CONFIG = {
+    "qweather_api_key": "YOUR_QWEATHER_API_KEY",
+    "web_search_api": "serper_api_key_实际有效的密钥",
+    "timeout": 10
+}

@@ -1,10 +1,7 @@
 import json
+from config.settings import KNOWLEDGE_CONFIG
 
-from sentence_transformers import SentenceTransformer
-
-from config.settings import KNOWLEDGE_CONFIG, DEVICE
-
-class KnowledgeBase:
+class KnowledgeManger:
     def __init__(self):
         self.faq_data = self._load_faq()
 
@@ -19,30 +16,21 @@ class KnowledgeBase:
             print("FAQ文件格式错误")
             return []
 
-    def retrieve(self, query, topk=2):
+    def retrieve(self, query):
         if not self.faq_data:
             return ""
         
-        # TODO: 适合教学
+        # 简单的关键词匹配（可替换为向量检索等更优方案）
         query_lower = query.lower()
         matched = []
         
         for item in self.faq_data:
             question = item.get("question", "").lower()
-            if self.compute_similarity(query_lower, question) > 0.5:
+            # 关键词匹配
+            if any(word in query_lower for word in question.split()):
                 matched.append(item.get("answer", ""))
         
         if matched:
-            return "\n\n".join(matched[:topk])
+            return "\n\n".join(matched[:2])  # 返回前2个匹配结果
         return ""
- 
-    def compute_similarity(self, query, question): # TODO: question的embedding预先加载
-        embedding1 = model.encode(query, convert_to_tensor=True).to(DEVICE)
-        embedding2 = model.encode(question, convert_to_tensor=True).to(DEVICE)
-    
-        cosine_similarity = torch.nn.functional.cosine_similarity(
-            embedding1.unsqueeze(0),
-            embedding2.unsqueeze(0)
-        ).item()
-    
-        return cosine_similarity
+
