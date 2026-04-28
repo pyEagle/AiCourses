@@ -9,3 +9,11 @@
 
 # Python 缓存
 **/__pycache__/
+
+# 模型文件
+*.ipynb_checkpoints/
+*.h5
+*.pkl
+*.pickle
+*.model
+*.weights
