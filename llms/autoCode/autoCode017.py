@@ -7,28 +7,28 @@ import subprocess
 import requests
 import torch
 from sentence_transformers import SentenceTransformer
-from collections import defaultdict, deque
-import re
+
 
 class DGARunner:
     def __init__(self, graph):
-        self.graph = graph
-        self.node_map = {node['id']: node for node in graph["nodes"]}
-        self.edges = graph["edges"]
+        self.nodes = graph.get("nodes", [])
+        self.edges = graph.get("edges", [])
 
     def topo_sort(self):
-        indegree = {node['id']: 0 for node in self.graph["nodes"]}
-        adj = defaultdict(list)
-        
-        for edge in self.edges:
-            source = edge['source']
-            target = edge['target']
-            adj[source].append(target)
-            indegree[target] += 1
+        from collections import defaultdict, deque
 
-        q = deque([node_id for node_id in indegree if indegree[node_id] == 0])
+        indegree = {n: 0 for n in self.nodes}
+        adj = defaultdict(list)
+
+        for u, v in self.edges:
+            if u not in indegree or v not in indegree:
+                continue
+            adj[u].append(v)
+            indegree[v] += 1
+
+        q = deque([n for n in self.nodes if indegree[n] == 0])
         order = []
-        
+
         while q:
             cur = q.popleft()
             order.append(cur)
@@ -37,8 +37,8 @@ class DGARunner:
                 if indegree[nxt] == 0:
                     q.append(nxt)
 
-        if len(order) != len(self.graph["nodes"]):
-            raise ValueError("非法DAG（存在环）")
+        if len(order) != len(self.nodes):
+            print("⚠️ DAG存在环或非法结构，已返回部分可执行顺序")
 
         return order
 
@@ -58,11 +58,17 @@ class SemanticBanditCore:
         self._load()
 
     def _get_feature_vector(self, text):
-        return self.model.encode(text, convert_to_tensor=True).to(self.device)
+        try:
+            return self.model.encode(text, convert_to_tensor=True).to(self.device)
+        except:
+            return torch.zeros(384).to(self.device)
 
     def _calculate_similarity(self, vec1, vec2):
-        sim = torch.nn.functional.cosine_similarity(vec1.unsqueeze(0), vec2.unsqueeze(0))
-        return sim.item()
+        try:
+            sim = torch.nn.functional.cosine_similarity(vec1.unsqueeze(0), vec2.unsqueeze(0))
+            return sim.item()
+        except:
+            return 0.0
 
     def add_or_update_arm(self, prompt):
         new_vec = self._get_feature_vector(prompt)
@@ -94,9 +100,12 @@ class SemanticBanditCore:
         scores = []
         for arm in self.arms:
             a, b = arm["history"].get(context_key, [1.1, 1.1])
-            sample = torch.distributions.Beta(
-                torch.tensor(a), torch.tensor(b)
-            ).sample().item()
+            try:
+                sample = torch.distributions.Beta(
+                    torch.tensor(a), torch.tensor(b)
+                ).sample().item()
+            except:
+                sample = 0.5
             scores.append(sample)
 
         return self.arms[int(torch.argmax(torch.tensor(scores)))]["prompt"]
@@ -112,21 +121,27 @@ class SemanticBanditCore:
         self._save()
 
     def _save(self):
-        data = []
-        for a in self.arms:
-            temp = a.copy()
-            temp["vec"] = temp["vec"].cpu().tolist()
-            data.append(temp)
-        with open(self.memory_path, "w") as f:
-            json.dump(data, f)
+        try:
+            data = []
+            for a in self.arms:
+                temp = a.copy()
+                temp["vec"] = temp["vec"].cpu().tolist()
+                data.append(temp)
+            with open(self.memory_path, "w") as f:
+                json.dump(data, f)
+        except:
+            print("⚠️ bandit 保存失败")
 
     def _load(self):
-        if os.path.exists(self.memory_path):
-            with open(self.memory_path) as f:
-                data = json.load(f)
-                for a in data:
-                    a["vec"] = torch.tensor(a["vec"]).to(self.device)
-                self.arms = data
+        try:
+            if os.path.exists(self.memory_path):
+                with open(self.memory_path) as f:
+                    data = json.load(f)
+                    for a in data:
+                        a["vec"] = torch.tensor(a["vec"]).to(self.device)
+                    self.arms = data
+        except:
+            print("⚠️ bandit 读取失败，已忽略")
 
 
 class SecureRunner:
@@ -136,8 +151,11 @@ class SecureRunner:
 
     def run(self, code):
         try:
+            if not code or "print" not in code:
+                return False, "生成代码无效"
+
             path = os.path.join(self.root, "main.py")
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w") as f:
                 f.write(code)
 
             res = subprocess.run(
@@ -146,10 +164,12 @@ class SecureRunner:
                 cwd=self.root,
                 capture_output=True,
                 text=True,
-                timeout=10,
-                encoding="utf-8"
+                timeout=10
             )
             return res.returncode == 0, res.stdout if res.returncode == 0 else res.stderr
+
+        except subprocess.TimeoutExpired:
+            return False, "执行超时"
         except Exception as e:
             return False, str(e)
 
@@ -162,31 +182,26 @@ class ResearchAgent:
         self.runner = SecureRunner()
 
     def _llm(self, prompt):
-        r = requests.post(self.api_url, json={
-            "model": "deepseek-r1:latest",
-            "prompt": prompt,
-            "stream": False
-        })
-        return r.json().get("response", "")
+        try:
+            r = requests.post(self.api_url, json={
+                "model": "deepseek-r1:latest",
+                "prompt": prompt,
+                "stream": False
+            }, timeout=30)
 
-    # 清理 LLM 返回的 markdown 代码块
-    def _clean_code(self, code):
-        code = re.sub(r"```python", "", code)
-        code = re.sub(r"```", "", code)
-        return code.strip()
+            return r.json().get("response", "")
+        except:
+            return ""
 
-    def solve_node(self, node_id, context_input, upstream_data=None, max_retry=2):
-        node = [n for n in context_input["graph"]["nodes"] if n["id"] == node_id][0]
-        context_key = f"{self.task}_{node_id}"
+    def solve_node(self, node, context_input, max_retry=3):
+        context_key = f"{self.task}_{node}"
 
         base_prompt = f"""
 任务: {self.task}
-节点: {node_id}
-节点配置: {node}
-上游输入数据: {upstream_data}
+当前模块: {node}
+输入: {context_input}
 
-请生成一段独立可运行的Python代码，只做一件事：执行该节点功能，用 print 输出结果（列表/数字直接打印）
-不要解释，不要用```包裹，只输出纯Python代码。
+请写Python代码，只输出print最终结果
 """
 
         arm_id = self.bandit.add_or_update_arm(base_prompt)
@@ -194,21 +209,21 @@ class ResearchAgent:
 
         last_error = ""
 
-        for i in range(max_retry):
-            full_prompt = prompt + f"\n上一次错误:\n{last_error}" if last_error else prompt
+        for _ in range(max_retry):
+            full_prompt = prompt + f"\n错误:{last_error}" if last_error else prompt
+
             code = self._llm(full_prompt)
-            code = self._clean_code(code)  # 关键修复
 
             ok, out = self.runner.run(code)
 
             if ok:
                 self.bandit.update_stats(arm_id, context_key, 1.0)
                 return out.strip()
+            else:
+                last_error = out
+                self.bandit.update_stats(arm_id, context_key, 0.0)
 
-            last_error = out
-            self.bandit.update_stats(arm_id, context_key, 0.0)
-
-        raise RuntimeError(f"节点失败: {node_id}\n错误信息:\n{last_error}")
+        return f"❌ 节点失败: {node} | 错误: {last_error}"
 
 
 class SSEOrchestrator:
@@ -217,13 +232,17 @@ class SSEOrchestrator:
         self.api_url = "http://localhost:11434/api/generate"
 
     def _llm(self, prompt):
-        r = requests.post(self.api_url, json={
-            "model": "deepseek-r1:latest",
-            "prompt": prompt,
-            "stream": False,
-            "format": "json"
-        })
-        return r.json().get("response", "{}")
+        try:
+            r = requests.post(self.api_url, json={
+                "model": "deepseek-r1:latest",
+                "prompt": prompt,
+                "stream": False,
+                "format": "json"
+            }, timeout=30)
+
+            return r.json().get("response", "{}")
+        except:
+            return "{}"
 
     def analyze(self):
         prompt = f"""
@@ -231,55 +250,48 @@ class SSEOrchestrator:
 
 {self.task}
 
-输出严格JSON格式:
+输出:
 {{
- "modules": [{{"name": "random"}}, {{"name": "math"}}, {{"name": "statistics"}}],
- "graph": {{
-   "nodes": [
-     {{"id":"GenerateRandomNumbers","module":"random","function":"random.choices","args":{{"population":list(range(1,101)),"k":100}}}},
-     {{"id":"FilterPrimes","module":"math","function":"isprime","args":{{"n":null}}}},
-     {{"id":"CalculateMean","module":"statistics","function":"mean","args":{{"data":null}}}},
-     {{"id":"CalculateVariance","module":"statistics","function":"variance","args":{{"data":null}}}}
-   ],
-   "edges": [
-     {{"source":"GenerateRandomNumbers","target":"FilterPrimes"}},
-     {{"source":"FilterPrimes","target":"CalculateMean"}},
-     {{"source":"FilterPrimes","target":"CalculateVariance"}}
-   ]
- }}
+ "modules":[{{"name":""}}],
+ "graph":{{"nodes":[],"edges":[]}}
 }}
 """
-        return json.loads(self._llm(prompt))
+        try:
+            return json.loads(self._llm(prompt))
+        except:
+            return {"modules": [], "graph": {"nodes": [], "edges": []}}
 
     def execute(self, plan):
-        dga = DGARunner(plan["graph"])
+        dga = DGARunner(plan.get("graph", {}))
         order = dga.topo_sort()
+
         agent = ResearchAgent(self.task)
-        memory = {"graph": plan["graph"]}
 
-        edge_map = defaultdict(list)
-        for e in plan["graph"]["edges"]:
-            edge_map[e["source"]].append(e["target"])
+        memory = {}
 
-        for node_id in order:
-            print(f"\n执行节点: {node_id}")
-            upstream = {src: memory[src] for src in memory if src != "graph" and node_id in edge_map[src]}
-            upstream_data = list(upstream.values())[0] if upstream else None
+        for node in order:
+            print(f"\n执行节点: {node}")
 
             input_data = {k: memory[k] for k in memory}
-            out = agent.solve_node(node_id, input_data, upstream_data)
-            memory[node_id] = out
+
+            out = agent.solve_node(node, input_data)
+
+            memory[node] = out
+
             print("输出:", out)
 
         return memory
 
 
 if __name__ == "__main__":
-    task = "编写一个Python脚本，找出1000以内最大的质数，代码直接打印最终结果"
+    task = "生成100个随机数，筛选质数，计算均值和方差"
+
     sse = SSEOrchestrator(task)
+
     plan = sse.analyze()
     print("DAG:", plan)
 
     result = sse.execute(plan)
+
     print("\n最终结果:", result)
 
