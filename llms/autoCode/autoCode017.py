@@ -1,6 +1,4 @@
 # -*- coding:utf-8 -*-
-
-import re
 import os
 import json
 import hashlib
@@ -8,9 +6,9 @@ import traceback
 import subprocess
 import requests
 import torch
-
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict, deque
+import re
 
 class DGARunner:
     def __init__(self, graph):
@@ -55,7 +53,6 @@ class SemanticBanditCore:
         try:
             self.model = SentenceTransformer('./model/LLms/sentence_transformers/', device=self.device)
         except:
-            print("本地模型加载失败，使用默认模型 all-MiniLM-L6-v2")
             self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
 
         self._load()
@@ -153,11 +150,8 @@ class SecureRunner:
                 encoding="utf-8"
             )
             return res.returncode == 0, res.stdout if res.returncode == 0 else res.stderr
-        except subprocess.TimeoutExpired:
-            return False, "执行超时 (超过10秒)"
         except Exception as e:
-            # 新增：捕获文件IO或其他系统级错误
-            return False, f"运行环境错误: {str(e)}"
+            return False, str(e)
 
 
 class ResearchAgent:
@@ -168,16 +162,12 @@ class ResearchAgent:
         self.runner = SecureRunner()
 
     def _llm(self, prompt):
-        try:
-            r = requests.post(self.api_url, json={
-                "model": "deepseek-r1:latest",
-                "prompt": prompt,
-                "stream": False
-            }, timeout=60) # 增加请求超时设置
-            return r.json().get("response", "")
-        except Exception as e:
-            print(f"LLM 请求错误: {e}")
-            return ""
+        r = requests.post(self.api_url, json={
+            "model": "deepseek-r1:latest",
+            "prompt": prompt,
+            "stream": False
+        })
+        return r.json().get("response", "")
 
     # 清理 LLM 返回的 markdown 代码块
     def _clean_code(self, code):
@@ -205,26 +195,18 @@ class ResearchAgent:
         last_error = ""
 
         for i in range(max_retry):
-            try:
-                full_prompt = prompt + f"\n上一次错误:\n{last_error}" if last_error else prompt
-                code = self._llm(full_prompt)
-                
-                if not code:
-                    last_error = "LLM未返回内容"
-                    continue
+            full_prompt = prompt + f"\n上一次错误:\n{last_error}" if last_error else prompt
+            code = self._llm(full_prompt)
+            code = self._clean_code(code)  # 关键修复
 
-                code = self._clean_code(code) 
-                ok, out = self.runner.run(code)
-                if ok:
-                    self.bandit.update_stats(arm_id, context_key, 1.0)
-                    return out.strip()
+            ok, out = self.runner.run(code)
 
-                last_error = out
-                self.bandit.update_stats(arm_id, context_key, 0.0)
-            
-            except Exception as e:
-                last_error = f"Agent内部错误: {str(e)}"
-                print(f"节点 {node_id} 尝试 {i+1} 失败: {last_error}")
+            if ok:
+                self.bandit.update_stats(arm_id, context_key, 1.0)
+                return out.strip()
+
+            last_error = out
+            self.bandit.update_stats(arm_id, context_key, 0.0)
 
         raise RuntimeError(f"节点失败: {node_id}\n错误信息:\n{last_error}")
 
@@ -235,17 +217,13 @@ class SSEOrchestrator:
         self.api_url = "http://localhost:11434/api/generate"
 
     def _llm(self, prompt):
-        try:
-            r = requests.post(self.api_url, json={
-                "model": "deepseek-r1:latest",
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"
-            }, timeout=60)
-            return r.json().get("response", "{}")
-        except Exception as e:
-            print(f"规划阶段 LLM 错误: {e}")
-            return "{}"
+        r = requests.post(self.api_url, json={
+            "model": "deepseek-r1:latest",
+            "prompt": prompt,
+            "stream": False,
+            "format": "json"
+        })
+        return r.json().get("response", "{}")
 
     def analyze(self):
         prompt = f"""
@@ -271,12 +249,7 @@ class SSEOrchestrator:
  }}
 }}
 """
-        response_text = self._llm(prompt)
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            print("警告: LLM返回的JSON格式无效，尝试继续执行...")
-            return {"graph": {"nodes": [], "edges": []}}
+        return json.loads(self._llm(prompt))
 
     def execute(self, plan):
         dga = DGARunner(plan["graph"])
@@ -294,14 +267,9 @@ class SSEOrchestrator:
             upstream_data = list(upstream.values())[0] if upstream else None
 
             input_data = {k: memory[k] for k in memory}
-            
-            try:
-                out = agent.solve_node(node_id, input_data, upstream_data)
-                memory[node_id] = out
-                print("输出:", out)
-            except Exception as e:
-                print(f"严重错误: 节点 {node_id} 执行失败 - {e}")
-                # 可以选择 break 或者 continue，这里选择继续尝试后续节点（虽然可能会因为缺少依赖数据而失败）
+            out = agent.solve_node(node_id, input_data, upstream_data)
+            memory[node_id] = out
+            print("输出:", out)
 
         return memory
 
@@ -309,7 +277,6 @@ class SSEOrchestrator:
 if __name__ == "__main__":
     task = "编写一个Python脚本，找出1000以内最大的质数，代码直接打印最终结果"
     sse = SSEOrchestrator(task)
-    
     plan = sse.analyze()
     print("DAG:", plan)
 
