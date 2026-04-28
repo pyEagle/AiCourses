@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
 import matplotlib.pyplot as plt
 
-plt.rcParams['font.sans-serif'] = ['Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# ======================
-# GridWorld
-# ======================
 class GridWorld:
     def __init__(self, size=6):
         self.size = size
@@ -28,10 +28,10 @@ class GridWorld:
 
     def step(self, action):
         x, y = self.pos
-        if action == 0: x -= 1      # up
-        if action == 1: x += 1      # down
-        if action == 2: y -= 1      # left
-        if action == 3: y += 1      # right
+        if action == 0: x -= 1
+        if action == 1: x += 1
+        if action == 2: y -= 1
+        if action == 3: y += 1
 
         reward = -0.01
         done = False
@@ -48,93 +48,106 @@ class GridWorld:
         return self._state(), reward, done
 
 
-# ======================
-# Actor-Critic
-# ======================
-class ActorCritic(tf.keras.Model):
+class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        self.fc1 = tf.keras.layers.Dense(128, activation='relu')
-        self.fc2 = tf.keras.layers.Dense(128, activation='relu')
-        self.pi = tf.keras.layers.Dense(action_dim)
-        self.v = tf.keras.layers.Dense(1)
+        self.common = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
+        self.pi = nn.Linear(128, action_dim)
+        self.v = nn.Linear(128, 1)
 
-    def call(self, s):
-        x = self.fc1(s)
-        x = self.fc2(x)
+    def forward(self, s):
+        x = self.common(s)
         return self.pi(x), self.v(x)
 
 
-# ======================
-# PPO Agent
-# ======================
 class PPO:
     def __init__(self, state_dim, action_dim):
         self.gamma = 0.99
         self.lam = 0.95
         self.clip = 0.2
         self.entropy_coef = 0.01
+        self.epochs = 4
+        self.batch_size = 64
 
-        self.model = ActorCritic(state_dim, action_dim)
-        self.opt = tf.keras.optimizers.Adam(3e-4)
+        self.model = ActorCritic(state_dim, action_dim).to(device)
+        self.opt = optim.Adam(self.model.parameters(), lr=3e-4)
 
     def select_action(self, s):
-        s = tf.convert_to_tensor(s.reshape(1, -1), dtype=tf.float32)
-        logits, v = self.model(s)
-        prob = tf.nn.softmax(logits)
+        s = torch.from_numpy(s).float().to(device).unsqueeze(0)
+        with torch.no_grad():
+            logits, v = self.model(s)
+            probs = torch.softmax(logits, dim=-1)
+            dist = Categorical(probs)
+            action = dist.sample()
+            logp = dist.log_prob(action)
 
-        action = np.random.choice(prob.shape[1], p=prob.numpy()[0])
-        logp = tf.math.log(prob[0, action] + 1e-8)
-
-        return action, logp.numpy().astype(np.float32), v.numpy()[0, 0].astype(np.float32)
+        return action.item(), logp.item(), v.item()
 
     def compute_gae(self, rewards, values, dones):
-        rewards = np.asarray(rewards, dtype=np.float32)
-        values = np.asarray(values, dtype=np.float32)
-
         adv = np.zeros_like(rewards, dtype=np.float32)
         gae = 0.0
-
         for t in reversed(range(len(rewards))):
             delta = rewards[t] + self.gamma * values[t + 1] * (1 - dones[t]) - values[t]
             gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
             adv[t] = gae
-
         return adv
 
     def train(self, states, actions, old_logps, returns, advs):
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions = tf.convert_to_tensor(actions, dtype=tf.int32)
-        old_logps = tf.convert_to_tensor(old_logps, dtype=tf.float32)
-        returns = tf.convert_to_tensor(returns, dtype=tf.float32)
-        advs = tf.convert_to_tensor(advs, dtype=tf.float32)
+        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
-        with tf.GradientTape() as tape:
-            logits, values = self.model(states)
-            values = tf.squeeze(values, axis=1)
+        states = torch.tensor(states, dtype=torch.float32).to(device)
+        actions = torch.tensor(actions, dtype=torch.int64).to(device)
+        old_logps = torch.tensor(old_logps, dtype=torch.float32).to(device)
+        returns = torch.tensor(returns, dtype=torch.float32).to(device)
+        advs = torch.tensor(advs, dtype=torch.float32).to(device)
 
-            probs = tf.nn.softmax(logits)
-            action_prob = tf.reduce_sum(
-                probs * tf.one_hot(actions, probs.shape[1]), axis=1
-            )
-            logp = tf.math.log(action_prob + 1e-8)
+        N = states.size(0)
+        idxs = np.arange(N)
 
-            ratio = tf.exp(logp - old_logps)
-            clipped = tf.clip_by_value(ratio, 1 - self.clip, 1 + self.clip) * advs
+        for _ in range(self.epochs):
+            np.random.shuffle(idxs)
 
-            loss_pi = -tf.reduce_mean(tf.minimum(ratio * advs, clipped))
-            loss_v = tf.reduce_mean(tf.square(returns - values))
-            entropy = -tf.reduce_mean(probs * tf.math.log(probs + 1e-8))
+            for start in range(0, N, self.batch_size):
+                end = start + self.batch_size
+                batch_idx = idxs[start:end]
 
-            loss = loss_pi + 0.5 * loss_v - self.entropy_coef * entropy
+                b_states = states[batch_idx]
+                b_actions = actions[batch_idx]
+                b_old_logps = old_logps[batch_idx]
+                b_returns = returns[batch_idx]
+                b_advs = advs[batch_idx]
 
-        grads = tape.gradient(loss, self.model.trainable_variables)
-        self.opt.apply_gradients(zip(grads, self.model.trainable_variables))
+                logits, values = self.model(b_states)
+                values = values.squeeze()
+
+                probs = torch.softmax(logits, dim=-1)
+                dist = Categorical(probs)
+                logp = dist.log_prob(b_actions)
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(logp - b_old_logps)
+                surr1 = ratio * b_advs
+                surr2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * b_advs
+                loss_pi = -torch.min(surr1, surr2).mean()
+
+                value_pred_clipped = b_returns + (values - b_returns).clamp(-0.2, 0.2)
+                value_losses = (values - b_returns).pow(2)
+                value_losses_clipped = (value_pred_clipped - b_returns).pow(2)
+                loss_v = torch.max(value_losses, value_losses_clipped).mean()
+
+                loss = loss_pi + 0.5 * loss_v - self.entropy_coef * entropy
+
+                self.opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.opt.step()
 
 
-# ======================
-# Training Loop
-# ======================
 env = GridWorld(size=6)
 agent = PPO(state_dim=36, action_dim=4)
 
@@ -142,7 +155,6 @@ EPISODES = 800
 
 for ep in range(EPISODES):
     s = env.reset()
-
     states, actions, rewards, logps, values, dones = [], [], [], [], [], []
     done = False
     ep_reward = 0.0
@@ -161,15 +173,15 @@ for ep in range(EPISODES):
         s = s2
         ep_reward += r
 
-    values.append(np.float32(0.0))
+    values.append(0.0)
 
     advs = agent.compute_gae(rewards, values, dones)
-    returns = advs + np.asarray(values[:-1], dtype=np.float32)
+    returns = advs + np.array(values[:-1], dtype=np.float32)
 
     agent.train(
-        np.asarray(states, dtype=np.float32),
-        actions,
-        logps,
+        np.array(states),
+        np.array(actions),
+        np.array(logps),
         returns,
         advs
     )
@@ -178,28 +190,30 @@ for ep in range(EPISODES):
         print(f"Episode {ep:4d} | Reward: {ep_reward:6.2f}")
 
 
-# ======================
-# Policy Visualization
-# ======================
 arrow = {0: '↑', 1: '↓', 2: '←', 3: '→'}
-policy = np.empty((6, 6), dtype=str)
+policy = np.empty((6, 6), dtype=object)
 
-for i in range(6):
-    for j in range(6):
-        s = np.zeros(36, dtype=np.float32)
-        s[i * 6 + j] = 1.0
-        logits, _ = agent.model(s.reshape(1, -1))
-        a = tf.argmax(logits, axis=1).numpy()[0]
-        policy[i, j] = arrow[a]
+agent.model.eval()
+with torch.no_grad():
+    for i in range(6):
+        for j in range(6):
+            s = np.zeros(36, dtype=np.float32)
+            s[i * 6 + j] = 1.0
+            s_ts = torch.from_numpy(s).to(device).unsqueeze(0)
+            logits, _ = agent.model(s_ts)
+            a = torch.argmax(logits, dim=1).item()
+            policy[i, j] = arrow[a]
 
 policy[5, 5] = 'G'
 
-plt.figure(figsize=(5, 5))
+plt.figure(figsize=(6, 6))
 for i in range(6):
     for j in range(6):
-        plt.text(j, 5 - i, policy[i, j], ha='center', va='center', fontsize=16)
+        plt.text(j, 5 - i, policy[i, j], ha='center', va='center', fontsize=20)
 
 plt.xticks(range(6))
 plt.yticks(range(6))
-plt.grid()
-plt.title("PPO(Arrow Map)")
+plt.grid(True)
+plt.title("PPO policy Map (Standard PPO)")
+plt.show()
+
