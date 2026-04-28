@@ -17,3 +17,8 @@
 *.pickle
 *.model
 *.weights
+
+# 系统缓存文件
+*.bak
+*.tmp
+*.swp
