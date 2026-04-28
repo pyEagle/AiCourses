@@ -9,9 +9,6 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 
-# ==========================================
-# 1. DAG执行器（不变）
-# ==========================================
 class DGARunner:
     def __init__(self, graph):
         self.nodes = graph["nodes"]
@@ -22,14 +19,12 @@ class DGARunner:
 
         indegree = {n: 0 for n in self.nodes}
         adj = defaultdict(list)
-
         for u, v in self.edges:
             adj[u].append(v)
             indegree[v] += 1
 
         q = deque([n for n in self.nodes if indegree[n] == 0])
         order = []
-
         while q:
             cur = q.popleft()
             order.append(cur)
@@ -39,14 +34,11 @@ class DGARunner:
                     q.append(nxt)
 
         if len(order) != len(self.nodes):
-            raise ValueError("❌ 非法DAG（存在环）")
+            raise ValueError("非法DAG（存在环）")
 
         return order
 
 
-# ==========================================
-# 2. Bandit（轻微增强：支持context）
-# ==========================================
 class SemanticBanditCore:
     def __init__(self, capacity=20):
         self.arms = []
@@ -133,9 +125,6 @@ class SemanticBanditCore:
                 self.arms = data
 
 
-# ==========================================
-# 3. 安全执行器（不变）
-# ==========================================
 class SecureRunner:
     def __init__(self, root="./sandbox"):
         self.root = root
@@ -160,9 +149,6 @@ class SecureRunner:
             return False, str(e)
 
 
-# ==========================================
-# 4. 🔥 ResearchAgent（核心升级：反思+多轮）
-# ==========================================
 class ResearchAgent:
     def __init__(self, task):
         self.task = task
@@ -212,9 +198,6 @@ class ResearchAgent:
         raise RuntimeError(f"节点失败: {node}")
 
 
-# ==========================================
-# 5. SSE（升级：逐节点执行）
-# ==========================================
 class SSEOrchestrator:
     def __init__(self, task):
         self.task = task
@@ -252,30 +235,21 @@ class SSEOrchestrator:
         memory = {}
 
         for node in order:
-            print(f"\n🚀 执行节点: {node}")
-
+            print(f"\n执行节点: {node}")
             input_data = {k: memory[k] for k in memory}
-
             out = agent.solve_node(node, input_data)
-
             memory[node] = out
-
-            print("✅ 输出:", out)
+            print("输出:", out)
 
         return memory
 
 
-# ==========================================
-# 6. 运行
-# ==========================================
 if __name__ == "__main__":
     task = "生成100个随机数，筛选质数，计算均值和方差"
-
     sse = SSEOrchestrator(task)
-
     plan = sse.analyze()
-    print("🧠 DAG:", plan)
+    print("DAG:", plan)
 
     result = sse.execute(plan)
+    print("\n最终结果:", result)
 
-    print("\n🏁 最终结果:", result)
