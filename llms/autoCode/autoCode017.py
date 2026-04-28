@@ -38,7 +38,7 @@ class DGARunner:
                     q.append(nxt)
 
         if len(order) != len(self.nodes):
-            print("⚠️ DAG存在环或非法结构，已返回部分可执行顺序")
+            print("DAG存在环或非法结构，已返回部分可执行顺序")
 
         return order
 
@@ -130,7 +130,7 @@ class SemanticBanditCore:
             with open(self.memory_path, "w") as f:
                 json.dump(data, f)
         except:
-            print("⚠️ bandit 保存失败")
+            print("bandit 保存失败")
 
     def _load(self):
         try:
@@ -141,7 +141,7 @@ class SemanticBanditCore:
                         a["vec"] = torch.tensor(a["vec"]).to(self.device)
                     self.arms = data
         except:
-            print("⚠️ bandit 读取失败，已忽略")
+            print("bandit 读取失败，已忽略")
 
 
 class SecureRunner:
@@ -223,7 +223,7 @@ class ResearchAgent:
                 last_error = out
                 self.bandit.update_stats(arm_id, context_key, 0.0)
 
-        return f"❌ 节点失败: {node} | 错误: {last_error}"
+        return f"节点失败: {node} | 错误: {last_error}"
 
 
 class SSEOrchestrator:
@@ -294,4 +294,3 @@ if __name__ == "__main__":
     result = sse.execute(plan)
 
     print("\n最终结果:", result)
-
