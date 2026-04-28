@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 
-import threading
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.multiprocessing as mp
 import numpy as np
-import tensorflow as tf
 import time
 
-# =========================
-# 超参数
-# =========================
 GRID_SIZE = 7
 STATE_DIM = GRID_SIZE * GRID_SIZE
 ACTION_DIM = 4
@@ -19,9 +18,8 @@ T_MAX = 10
 MAX_EPISODES = 800
 NUM_WORKERS = 4
 
-# =========================
-# 环境
-# =========================
+DEVICE = torch.device("cpu")
+
 class GridWorld:
     def __init__(self, size):
         self.size = size
@@ -60,133 +58,124 @@ class GridWorld:
 
         return self._state(), -0.02, False
 
-# =========================
-# Actor-Critic
-# =========================
-class ActorCritic(tf.keras.Model):
+
+class ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc = tf.keras.layers.Dense(128, activation='relu')
-        self.pi = tf.keras.layers.Dense(ACTION_DIM)
-        self.v = tf.keras.layers.Dense(1)
+        self.fc = nn.Linear(STATE_DIM, 128)
+        self.pi = nn.Linear(128, ACTION_DIM)
+        self.v = nn.Linear(128, 1)
 
-    def call(self, x):
-        x = self.fc(x)
+    def forward(self, x):
+        x = F.relu(self.fc(x))
         return self.pi(x), self.v(x)
 
-# =========================
-# Worker
-# =========================
-class Worker(threading.Thread):
-    def __init__(self, wid, global_net, optimizer, global_ep):
-        super().__init__()
-        self.wid = wid
-        self.global_net = global_net
-        self.optimizer = optimizer
-        self.global_ep = global_ep
 
-        self.local_net = ActorCritic()
-        dummy = tf.zeros((1, STATE_DIM))
-        self.local_net(dummy)
-        self.local_net.set_weights(self.global_net.get_weights())
+def worker(wid, global_net, optimizer, global_ep, lock):
+    local_net = ActorCritic()
+    env = GridWorld(GRID_SIZE)
 
-        self.env = GridWorld(GRID_SIZE)
+    while True:
+        with lock:
+            if global_ep.value >= MAX_EPISODES:
+                break
+            global_ep.value += 1
+            ep_id = global_ep.value
 
-    def run(self):
-        while self.global_ep[0] < MAX_EPISODES:
-            s = self.env.reset()
-            states, actions, rewards = [], [], []
-            ep_r = 0
+        local_net.load_state_dict(global_net.state_dict())
 
-            for _ in range(T_MAX):
-                logits, _ = self.local_net(tf.expand_dims(s, 0))
-                probs = tf.nn.softmax(logits)[0].numpy()
-                a = np.random.choice(ACTION_DIM, p=probs)
+        s = env.reset()
+        states, actions, rewards = [], [], []
+        ep_r = 0
 
-                s_, r, done = self.env.step(a)
-                states.append(s)
-                actions.append(a)
-                rewards.append(r)
+        for _ in range(T_MAX):
+            s_tensor = torch.FloatTensor(s).unsqueeze(0)
+            logits, _ = local_net(s_tensor)
 
-                s = s_
-                ep_r += r
-                if done:
-                    break
+            probs = F.softmax(logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            a = dist.sample().item()
+
+            s_, r, done = env.step(a)
+
+            states.append(s)
+            actions.append(a)
+            rewards.append(r)
+
+            s = s_
+            ep_r += r
 
             if done:
-                R = 0.0
-            else:
-                _, v = self.local_net(tf.expand_dims(s, 0))
-                R = float(v.numpy()[0, 0])
+                break
 
-            returns = []
-            for r in reversed(rewards):
-                R = r + GAMMA * R
-                returns.insert(0, R)
+        if done:
+            R = 0.0
+        else:
+            s_tensor = torch.FloatTensor(s).unsqueeze(0)
+            _, v = local_net(s_tensor)
+            R = v.item()
 
-            self.update_global(states, actions, returns)
-            self.global_ep[0] += 1
+        returns = []
+        for r in reversed(rewards):
+            R = r + GAMMA * R
+            returns.insert(0, R)
 
-            if self.wid == 0 and self.global_ep[0] % 10 == 0:
-                print(f"[Episode {self.global_ep[0]}] reward={ep_r:.2f}")
+        s_batch = torch.FloatTensor(np.array(states))
+        a_batch = torch.LongTensor(actions)
+        r_batch = torch.FloatTensor(returns)
 
-    def update_global(self, states, actions, returns):
-        states = tf.convert_to_tensor(states, tf.float32)
-        actions = tf.convert_to_tensor(actions, tf.int32)
-        returns = tf.convert_to_tensor(returns, tf.float32)
+        logits, values = local_net(s_batch)
+        values = values.squeeze(1)
 
-        with tf.GradientTape() as tape:
-            logits, values = self.global_net(states)
-            values = tf.squeeze(values, 1)
-            td = returns - values
+        td = r_batch - values
 
-            logp = tf.reduce_sum(
-                tf.one_hot(actions, ACTION_DIM) *
-                tf.nn.log_softmax(logits), axis=1
-            )
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
 
-            entropy = -tf.reduce_sum(
-                tf.nn.softmax(logits) *
-                tf.nn.log_softmax(logits), axis=1
-            )
+        log_p_a = log_probs.gather(1, a_batch.unsqueeze(1)).squeeze(1)
 
-            loss = (
-                -tf.reduce_mean(logp * td)
-                + 0.5 * tf.reduce_mean(td ** 2)
-                - ENTROPY_BETA * tf.reduce_mean(entropy)
-            )
+        policy_loss = -(log_p_a * td.detach()).mean()
+        value_loss = 0.5 * td.pow(2).mean()
+        entropy = -(probs * log_probs).sum(dim=1).mean()
 
-        grads = tape.gradient(loss, self.global_net.trainable_variables)
-        self.optimizer.apply_gradients(
-            zip(grads, self.global_net.trainable_variables)
-        )
-        self.local_net.set_weights(self.global_net.get_weights())
+        loss = policy_loss + value_loss - ENTROPY_BETA * entropy
 
-# =========================
-# 训练
-# =========================
+        optimizer.zero_grad()
+        loss.backward()
+
+        for lp, gp in zip(local_net.parameters(), global_net.parameters()):
+            gp._grad = lp.grad
+
+        optimizer.step()
+
+        if wid == 0 and ep_id % 10 == 0:
+            print(f"[Episode {ep_id}] reward={ep_r:.2f}")
+
+
 def train():
+    mp.set_start_method('spawn', force=True)
+
     global_net = ActorCritic()
-    dummy = tf.zeros((1, STATE_DIM))
-    global_net(dummy)
+    global_net.share_memory()
 
-    optimizer = tf.keras.optimizers.Adam(LR)
-    optimizer.build(global_net.trainable_variables)
+    optimizer = torch.optim.Adam(global_net.parameters(), lr=LR)
 
-    global_ep = [0]
-    workers = [Worker(i, global_net, optimizer, global_ep)
-               for i in range(NUM_WORKERS)]
+    global_ep = mp.Value('i', 0)
+    lock = mp.Lock()
 
-    start = time.time()
-    for w in workers: w.start()
-    for w in workers: w.join()
+    workers = []
+    for i in range(NUM_WORKERS):
+        p = mp.Process(target=worker,
+                       args=(i, global_net, optimizer, global_ep, lock))
+        p.start()
+        workers.append(p)
 
-    print("Training finished. Time:", time.time() - start)
+    for p in workers:
+        p.join()
+
     return global_net
 
-# =========================
-# 策略可视化
-# =========================
+
 def visualize_policy(net):
     env = GridWorld(GRID_SIZE)
     arrows = ['↑', '↓', '←', '→']
@@ -196,22 +185,28 @@ def visualize_policy(net):
         row = []
         for y in range(GRID_SIZE):
             if (x, y) in env.walls:
-                row.append('#')
+                row.append(' # ')
             elif (x, y) in env.traps:
-                row.append('T')
+                row.append(' T ')
             elif (x, y) in env.goals:
-                row.append('G')
+                row.append(' G ')
             else:
                 s = np.zeros(STATE_DIM, np.float32)
                 s[x * GRID_SIZE + y] = 1.0
-                logits, _ = net(tf.expand_dims(s, 0))
-                a = tf.argmax(logits, axis=1).numpy().item()
-                row.append(arrows[a])
-        print(' '.join(row))
+                s_tensor = torch.FloatTensor(s).unsqueeze(0)
 
-# =========================
-# main
-# =========================
+                with torch.no_grad():
+                    logits, _ = net(s_tensor)
+                    a = torch.argmax(logits, dim=1).item()
+
+                row.append(f" {arrows[a]} ")
+        print(''.join(row))
+
+
 if __name__ == "__main__":
+    start = time.time()
     net = train()
+    print("Training finished:", time.time() - start)
+
     visualize_policy(net)
+
