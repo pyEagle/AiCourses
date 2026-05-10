@@ -1,3 +1,5 @@
+# -*- coding:utf-8 -*-
+
 import re
 
 from core.llmClient import OllamaClient
