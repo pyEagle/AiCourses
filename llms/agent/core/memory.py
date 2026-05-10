@@ -1,5 +1,8 @@
+# -*- coding:utf-8 -*-
+
 import json
 import redis
+
 from config.settings import REDIS_CONFIG
 
 class RedisMemory:
@@ -25,11 +28,6 @@ class RedisMemory:
             return []
 
     def save_message(self, session_id, role, content):
-        """
-        :param session_id: 会话ID
-        :param role: 角色（user/assistant）
-        :param content: 消息内容
-        """
         try:
             history = self.get_history(session_id)
             history.append({"role": role, "content": content})

@@ -1,3 +1,5 @@
+# -*- coding:utf-8 -*-
+
 import ollama
 
 from config.settings import OLLAMA_CONFIG

@@ -1,3 +1,5 @@
+# -*- coding:utf-8 -*-
+
 from tools.calculator import Calculator
 
 class ToolManager:

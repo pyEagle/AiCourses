@@ -1,4 +1,7 @@
+# -*- coding:utf-8 -*-
+
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,10 +28,6 @@ KNOWLEDGE_CONFIG = {
     "docs_dir":"./docs/",
 }
 
-TOOL_CONFIG = {
-    "web_search_api": os.getenv("SEARCH_API", ""),  # 可替换为实际搜索API
-    "timeout": 10
-}
 
 TOOL_CONFIG = {
     "qweather_api_key": "YOUR_QWEATHER_API_KEY",
