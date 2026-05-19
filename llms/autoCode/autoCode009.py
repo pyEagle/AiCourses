@@ -21,8 +21,7 @@ class SemanticBanditCore:
         self.memory_path = "bandit_memory.json"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(
-            '/usr/songzs/model/LLms/sentence_transformers/',
-            #'./model/LLms/sentence_transformers/',
+            './model/LLms/sentence_transformers/',
             device=self.device
         )
 
