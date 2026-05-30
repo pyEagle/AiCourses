@@ -36,12 +36,3 @@ class CaptureSound:
 
             print("采集设备已安全关闭")
 
-if __name__ == "__main__":
-    cs = CaptureSound()
-    audio_stream = cs.run()
-    try:
-        for chunk_data in audio_stream:
-            print(f"成功采集到音频片段，大小: {len(chunk_data)} 字节")
-    except KeyboardInterrupt:
-        pass
-
