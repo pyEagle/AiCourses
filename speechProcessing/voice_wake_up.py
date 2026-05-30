@@ -45,8 +45,3 @@ class VoiceWakeUp:
                     self.date_timer = None
                     print("AI：先回去睡个回笼觉嘞")
 
-
-if __name__ == "__main__":
-    vwu = VoiceWakeUp('小红，你好', 5)
-    vwu.run()
-
