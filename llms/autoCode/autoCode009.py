@@ -16,81 +16,43 @@ from sentence_transformers import SentenceTransformer
 
 
 class SemanticBanditCore:
-
     def __init__(self, capacity=50):
-
         self.capacity = capacity
         self.memory_path = "bandit_memory.json"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        print(f"[Bandit] device={self.device}")
-
         self.model = SentenceTransformer(
             './model/LLms/sentence_transformers/',
             device=self.device
         )
-
         self.arms = []
         self.decay = 0.995
 
         self._load()
 
-    # =====================================================
-    # Embedding
-    # =====================================================
-
     def _get_feature_vector(self, text):
-
-        vec = self.model.encode(
-            text,
-            convert_to_tensor=True
-        )
-
+        vec = self.model.encode(text, convert_to_tensor=True)
         return vec.to(self.device)
 
     def _calculate_similarity(self, vec1, vec2):
-
         sim = torch.nn.functional.cosine_similarity(
-            vec1.unsqueeze(0),
-            vec2.unsqueeze(0)
-        )
+            vec1.unsqueeze(0), vec2.unsqueeze(0))
 
         return sim.item()
 
-    # =====================================================
-    # Task Cluster
-    # =====================================================
-
-    def get_task_cluster(self, task):
-
+    def get_task_cluster(self, task): # TODO
         task = task.lower()
-
         if "flask" in task or "fastapi" in task or "api" in task:
             return "python_api"
-
-        if "爬虫" in task or "crawler" in task:
-            return "crawler"
-
         if "机器学习" in task or "pytorch" in task:
             return "ml"
 
-        if "算法" in task or "质数" in task:
-            return "algorithm"
-
         return "general"
 
-    # =====================================================
-    # Arm
-    # =====================================================
-
     def add_arm(self, prompt_template, cluster, arm_type="base"):
-
         arm_id = hashlib.md5(
             (prompt_template + str(time.time())).encode()
         ).hexdigest()[:8]
-
         vec = self._get_feature_vector(prompt_template)
-
         arm = {
             "id": arm_id,
             "cluster": cluster,
@@ -104,32 +66,18 @@ class SemanticBanditCore:
         }
 
         self.arms.append(arm)
-
         self._prune()
         self._save()
 
         return arm_id
 
-    # =====================================================
-    # Retrieve
-    # =====================================================
-
-    def retrieve_similar_arms(
-            self,
-            prompt,
-            cluster,
-            topk=5
-    ):
-
+    def retrieve_similar_arms(self, prompt, cluster, topk=5):
         if not self.arms:
             return []
 
         query_vec = self._get_feature_vector(prompt)
-
         scored = []
-
         for arm in self.arms:
-
             if arm["cluster"] != cluster:
                 continue
 
@@ -146,40 +94,23 @@ class SemanticBanditCore:
         )
 
         result = []
-
         for sim, arm in scored[:topk]:
-
             if sim > 0.65:
                 result.append(arm)
 
         return result
 
-    # =====================================================
-    # Thompson Sampling
-    # =====================================================
-
-    def sample(
-            self,
-            context_key,
-            candidates,
-            fallback_prompt
-    ):
-
+    def sample(self, context_key, candidates, fallback_prompt):
         if not candidates:
 
-            return {
-                "id": None,
-                "prompt_template": fallback_prompt
-            }
+            return {"id": None, "prompt_template": fallback_prompt}
 
         alpha_list = []
         beta_list = []
 
         for arm in candidates:
-
             suc = arm["success"].get(context_key, 1.1)
             fail = arm["failure"].get(context_key, 1.1)
-
             alpha_list.append(suc)
             beta_list.append(fail)
 
@@ -193,43 +124,24 @@ class SemanticBanditCore:
             device=self.device
         )
 
-        dist = torch.distributions.Beta(
-            alpha_tensor,
-            beta_tensor
-        )
-
+        dist = torch.distributions.Beta(alpha_tensor, beta_tensor)
         samples = dist.sample()
-
         idx = torch.argmax(samples).item()
 
         return candidates[idx]
 
-    # =====================================================
-    # Update
-    # =====================================================
-
-    def update_stats(
-            self,
-            arm_id,
-            context_key,
-            reward
-    ):
-
+    def update_stats(self,arm_id, context_key, reward):
         if arm_id is None:
             return
 
         for arm in self.arms:
-
             if arm["id"] == arm_id:
-
                 if context_key not in arm["success"]:
                     arm["success"][context_key] = 1.1
-
                 if context_key not in arm["failure"]:
                     arm["failure"][context_key] = 1.1
 
                 arm["success"][context_key] += reward
-
                 arm["failure"][context_key] += (
                     (1.0 - reward) * 0.2
                 )
@@ -244,26 +156,15 @@ class SemanticBanditCore:
         self._apply_decay()
         self._save()
 
-    # =====================================================
-    # Decay
-    # =====================================================
-
     def _apply_decay(self):
-
         for arm in self.arms:
-
             for ctx in arm["success"]:
                 arm["success"][ctx] *= self.decay
 
             for ctx in arm["failure"]:
                 arm["failure"][ctx] *= self.decay
 
-    # =====================================================
-    # Prune
-    # =====================================================
-
     def _prune(self):
-
         if len(self.arms) <= self.capacity:
             return
 
@@ -777,26 +678,14 @@ class ResearchAgent:
                 last_log
             )
 
-            self.bandit.update_stats(
-                arm_id,
-                context,
-                reward
-            )
-
+            self.bandit.update_stats(arm_id,context,reward)
             print(f"[FAILED] reward={reward}")
 
         return None
 
 
-
 if __name__ == "__main__":
-
-    agent = ResearchAgent(
-        "编写一个Python脚本，找出1000以内最大的质数，并打印结果"
-    )
-
+    agent = ResearchAgent("编写一个Python脚本，找出1000以内最大的质数，并打印结果")
     result = agent.run()
-
-    print("\nFINAL RESULT:\n")
-
     print(result)
+
