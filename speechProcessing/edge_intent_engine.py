@@ -1,9 +1,15 @@
 # -*- coding:utf-8 -*-
 
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["NO_MPS"] = "1"
+import sys
+
+if sys.platform == 'darwin':
+    print("当前是 macOS 平台")
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["NO_MPS"] = "1"
+else:
+    print(f"当前平台是: {sys.platform}")
 
 import joblib
 import numpy as np
