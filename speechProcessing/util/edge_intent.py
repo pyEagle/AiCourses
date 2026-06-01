@@ -5,6 +5,7 @@ import os
 import joblib
 import numpy as np
 import unicodedata
+import requests
 
 from sentence_transformers import SentenceTransformer
 from lightgbm import LGBMClassifier
@@ -28,6 +29,13 @@ class EdgeIntentEngine:
         self.api_mapping = {}
         self.inverted_index = defaultdict(set)
         self.text_vectors = {}
+
+        # TODO: Agent
+        self.agent_flag = True
+        self.agent_url = "http://127.0.0.1:9090/api/chat"
+
+    def set_agent_flag(self, flag):
+        self.agent_flag = flag
 
     @staticmethod
     def clean_text(text):
@@ -124,11 +132,17 @@ class EdgeIntentEngine:
 
         if max_p >= self.confidence_threshold:
             return self._build_response(True, self.clf.classes_[max_idx], max_p, "ml_model")
+        else:
+            if self.agent_flag:
+                response = self.ask_agent(text)
+                if response.status_code == 200:
+                    result = response.json()
+                    return self._build_response(True, result['data']['reply'], 1, "ai_agent")
 
         return self._build_response(False, "未能识别", 0.0, "none")
 
     def _build_response(self, success, result, confidence, indent_path):
-        print('意图识别路径', indent_path)
+        print('意图识别路径', indent_path, )
 
         intent_info = self.api_mapping.get(result, {}) if success else {}
         return {
@@ -136,4 +150,12 @@ class EdgeIntentEngine:
             "intent": intent_info.get("意图", "未知"),
             "confidence": round(float(confidence), 4),
         }
+
+    def ask_agent(self, message):
+        payload = {
+            "message": message,
+            "session_id": "session_001",
+            }
+        
+        return requests.post(self.agent_url, json=payload, timeout=5)
 
