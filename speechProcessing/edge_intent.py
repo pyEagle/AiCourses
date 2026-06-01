@@ -93,7 +93,7 @@ class EdgeIntentEngine:
     def predict(self, text):
         text = self.clean_text(text)
         if text in self.exact_match_cache:
-            return self._build_response(True, self.exact_match_cache[text], 1.0, "exact_match")
+            return self._build_response(self.exact_match_cache[text], 1.0, "exact_match")
 
         query_words = text.split() if ' ' in text else list(text)
         candidate_texts = set()
@@ -115,7 +115,7 @@ class EdgeIntentEngine:
                     best_text = cand_text
             if best_sim >= self.similarity_threshold and best_text:
                 api = self.exact_match_cache[best_text]
-                return self._build_response(True, api, best_sim, "inverted_similarity")
+                return self._build_response(api, best_sim, "inverted_similarity")
 
         vector = self.encoder.encode([text])
         prob = self.clf.predict_proba(vector)[0]
@@ -123,17 +123,17 @@ class EdgeIntentEngine:
         max_p = prob[max_idx]
 
         if max_p >= self.confidence_threshold:
-            return self._build_response(True, self.clf.classes_[max_idx], max_p, "ml_model")
+            return self._build_response(self.clf.classes_[max_idx], max_p, "ml_model")
 
-        return self._build_response(False, "未能识别", 0.0, "none")
+        return self._build_response("未能识别", 0.0, "none")
 
-    def _build_response(self, success, result, confidence, source):
+    def _build_response(self, result, confidence, indent_path):
+        print('意图识别路径', indent_path)
+
         intent_info = self.api_mapping.get(result, {}) if success else {}
         return {
-            "status": "success" if success else "fail",
             "api": result if success else None,
             "intent": intent_info.get("意图", "未知"),
             "confidence": round(float(confidence), 4),
-            "source": source
         }
 
