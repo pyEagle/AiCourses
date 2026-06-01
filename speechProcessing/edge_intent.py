@@ -4,7 +4,7 @@ import os
 import sys
 
 if sys.platform == 'darwin':
-    print("当前是 macOS 平台")
+    print("当前平台是: macOS 平台")
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NO_MPS"] = "1"
@@ -15,47 +15,60 @@ import joblib
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from lightgbm import LGBMClassifier
+from collections import defaultdict
 
-"""
-training_data = [
-    {'意图': '灯光控制', '描述': '开灯', 'API': '/light/on'},
-    {'意图': '灯光控制', '描述': '关灯', 'API': '/light/off'},
-]
-"""
+
 class EdgeIntentEngine:
-    def __init__(self, confidence_threshold=0.45):
+    def __init__(self, confidence_threshold=0.45, similarity_threshold=0.7):
         self.confidence_threshold = confidence_threshold
+        self.similarity_threshold = similarity_threshold
         self.encoder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         self.clf = LGBMClassifier(
-            random_state=42, 
-            class_weight='balanced', 
+            random_state=42,
+            class_weight='balanced',
             verbose=-1,
-            n_jobs=1, # for mac os 
+            n_jobs=1,
         )
         self.exact_match_cache = {}
         self.api_mapping = {}
+        self.inverted_index = defaultdict(set)
+        self.text_vectors = {}
+
+    def _build_inverted_index(self, texts):
+        for text in texts:
+            words = list(text)
+            for word in words:
+                self.inverted_index[word].add(text)
+
+    def _cosine_similarity(self, vec1, vec2):
+        dot = np.dot(vec1, vec2)
+        norm = np.linalg.norm(vec1) * np.linalg.norm(vec2)
+        return dot / (norm + 1e-8)
 
     def train(self, dataset, model_path="edge_model.pkl"):
         texts = [item['描述'] for item in dataset]
         labels = [item['API'] for item in dataset]
-        
+
         for item in dataset:
             self.exact_match_cache[item['描述']] = item['API']
             self.api_mapping[item['API']] = item
 
-        print("[*] 语义特征提取...")
+        self._build_inverted_index(texts)
         features = self.encoder.encode(texts)
-        
-        print("[*] 训练LightGBM 分类器...")
+        for text, vec in zip(texts, features):
+            self.text_vectors[text] = vec
+
         self.clf.fit(features, labels)
 
         joblib.dump({
             'exact_match_cache': self.exact_match_cache,
             'api_mapping': self.api_mapping,
             'encoder': self.encoder,
-            'clf': self.clf
+            'clf': self.clf,
+            'inverted_index': self.inverted_index,
+            'text_vectors': self.text_vectors
         }, model_path)
-        print(f"[*] 模型及缓存已成功保存至: {model_path}")
+        print(f"模型及缓存已成功保存至: {model_path}")
 
     def load(self, model_path="edge_model.pkl"):
         try:
@@ -64,6 +77,8 @@ class EdgeIntentEngine:
             self.api_mapping = data['api_mapping']
             self.encoder = data['encoder']
             self.clf = data['clf']
+            self.inverted_index = data.get('inverted_index', defaultdict(set))
+            self.text_vectors = data.get('text_vectors', {})
             print(f"[*] 成功加载模型组件")
         except Exception as e:
             print(f"[!] 加载失败: {e}")
@@ -71,17 +86,38 @@ class EdgeIntentEngine:
     def predict(self, text):
         text = text.strip()
         if text in self.exact_match_cache:
-            return self._build_response(True, self.exact_match_cache[text], 1.0, "cache")
-        
-        # 提取特征
+            return self._build_response(True, self.exact_match_cache[text], 1.0, "exact_match")
+
+        query_words = text.split() if ' ' in text else list(text)
+        candidate_texts = set()
+        for word in query_words:
+            if word in self.inverted_index:
+                candidate_texts.update(self.inverted_index.get(word))
+
+        if candidate_texts:
+            query_vec = self.encoder.encode(text)
+            best_sim = 0.0
+            best_text = None
+            for cand_text in candidate_texts:
+                cand_vec = self.text_vectors.get(cand_text)
+                if cand_vec is None:
+                    continue
+                sim = self._cosine_similarity(query_vec, cand_vec)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_text = cand_text
+            if best_sim >= self.similarity_threshold and best_text:
+                api = self.exact_match_cache[best_text]
+                return self._build_response(True, api, best_sim, "inverted_similarity")
+
         vector = self.encoder.encode([text])
         prob = self.clf.predict_proba(vector)[0]
         max_idx = np.argmax(prob)
         max_p = prob[max_idx]
-        
+
         if max_p >= self.confidence_threshold:
             return self._build_response(True, self.clf.classes_[max_idx], max_p, "ml_model")
-        
+
         return self._build_response(False, "未能识别", 0.0, "none")
 
     def _build_response(self, success, result, confidence, source):
@@ -93,5 +129,3 @@ class EdgeIntentEngine:
             "confidence": round(float(confidence), 4),
             "source": source
         }
-
-
