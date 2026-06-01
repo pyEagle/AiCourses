@@ -1,18 +1,11 @@
 # -*- coding:utf-8 -*-
 
+import re
 import os
-import sys
-
-if sys.platform == 'darwin':
-    print("当前平台是: macOS 平台")
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ["NO_MPS"] = "1"
-else:
-    print(f"当前平台是: {sys.platform}")
-
 import joblib
 import numpy as np
+import unicodedata
+
 from sentence_transformers import SentenceTransformer
 from lightgbm import LGBMClassifier
 from collections import defaultdict
@@ -29,14 +22,25 @@ class EdgeIntentEngine:
             verbose=-1,
             n_jobs=1,
         )
+
+        self.model_path="./model/edge_model.pkl"
         self.exact_match_cache = {}
         self.api_mapping = {}
         self.inverted_index = defaultdict(set)
         self.text_vectors = {}
 
+    @staticmethod
+    def clean_text(text):
+        temp =''.join(
+            c for c in text 
+            if not unicodedata.category(c).startswith('P')
+        )
+
+        return re.sub(r'\s+', ' ', temp).strip()
+
     def _build_inverted_index(self, texts):
         for text in texts:
-            words = list(text)
+            words = list(self.clean_text(text))
             for word in words:
                 self.inverted_index[word].add(text)
 
@@ -45,7 +49,7 @@ class EdgeIntentEngine:
         norm = np.linalg.norm(vec1) * np.linalg.norm(vec2)
         return dot / (norm + 1e-8)
 
-    def train(self, dataset, model_path="edge_model.pkl"):
+    def train(self, dataset):
         texts = [item['描述'] for item in dataset]
         labels = [item['API'] for item in dataset]
 
@@ -67,12 +71,15 @@ class EdgeIntentEngine:
             'clf': self.clf,
             'inverted_index': self.inverted_index,
             'text_vectors': self.text_vectors
-        }, model_path)
-        print(f"模型及缓存已成功保存至: {model_path}")
+        }, self.model_path)
+        print(f"模型及缓存已成功保存至: {self.model_path}")
 
-    def load(self, model_path="edge_model.pkl"):
+    def set_model_file(self, model_file):
+        self.model_path = model_file
+
+    def load(self):
         try:
-            data = joblib.load(model_path)
+            data = joblib.load(self.model_path)
             self.exact_match_cache = data['exact_match_cache']
             self.api_mapping = data['api_mapping']
             self.encoder = data['encoder']
@@ -84,7 +91,7 @@ class EdgeIntentEngine:
             print(f"[!] 加载失败: {e}")
 
     def predict(self, text):
-        text = text.strip()
+        text = self.clean_text(text)
         if text in self.exact_match_cache:
             return self._build_response(True, self.exact_match_cache[text], 1.0, "exact_match")
 
@@ -129,3 +136,4 @@ class EdgeIntentEngine:
             "confidence": round(float(confidence), 4),
             "source": source
         }
+
