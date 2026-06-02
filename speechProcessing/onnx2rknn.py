@@ -1,3 +1,7 @@
+"""
+pip install rknn-toolkit2
+"""
+
 from rknn.api import RKNN
 
 ONNX_MODEL = "./onnx_output/model.onnx"
