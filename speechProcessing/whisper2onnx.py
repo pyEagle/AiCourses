@@ -1,3 +1,12 @@
+"""
+cpu
+pip install -U onnxruntime
+gpu
+
+pip install -U onnxruntime-gpu
+pip install -U optimum transformers accelerate
+"""
+
 from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
 from transformers import WhisperProcessor
 
