@@ -9,18 +9,6 @@ from ultralytics import YOLO
 from config.settings import FollowerConfig
 
 
-@dataclass
-class FollowerConfig:
-    model_name  = 'yolov8n.pt'
-    camera_id  = 0
-    target_class  = 0        # 0: person
-    safe_area  = 80000
-    area_tolerance  = 10000
-    kp_turn  = 0.1
-    kp_speed  = 0.0005
-    max_output  = 50.0
-
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
