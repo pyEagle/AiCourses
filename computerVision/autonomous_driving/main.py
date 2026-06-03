@@ -7,6 +7,7 @@ from ultralytics import YOLO
 
 from util.detect_lanes import detect_lanes
 from util.detect_obstacles import detect_obstacles
+from util.navigate import navigate
 
 class AutonomousDrivingSystem:
     def __init__(self, video_path):
@@ -42,16 +43,6 @@ class AutonomousDrivingSystem:
                 danger_zone = True
                 
         return bev_map, danger_zone
-
-    def navigate(self, center_offset, danger_zone):
-        if danger_zone:
-            return "BRAKE (Obstacle Ahead!)", (0, 0, 255)
-        elif center_offset == -1:
-            return "STEER RIGHT (Adjust Lane)", (0, 255, 255)
-        elif center_offset == 1:
-            return "STEER LEFT (Adjust Lane)", (0, 255, 255)
-        else:
-            return "CRUISE (Path Clear)", (0, 255, 0)
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path) 
