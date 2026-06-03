@@ -37,7 +37,7 @@ class VisionFollower:
             raise
 
     def _init_camera(self):
-        logger.info(f"Opening camera {self.cfg.camera_id}...")
+        logger.info(f"打开摄像头 {self.cfg.camera_id}...")
         cap = cv2.VideoCapture(self.cfg.camera_id)
         if not cap.isOpened():
             logger.error(f"Cannot open camera ID {self.cfg.camera_id}")
@@ -53,10 +53,10 @@ class VisionFollower:
         
         if abs(error_area) < self.cfg.area_tolerance:
             motor_speed = 0.0
-            action_text = "Status: HOLD POSITION"
+            action_text = "状态: 保持"
         else:
             motor_speed = error_area * self.cfg.kp_speed
-            action_text = "Status: MOVING FORWARD" if motor_speed > 0 else "Status: MOVING BACKWARD"
+            action_text = "状态: 跟随" if motor_speed > 0 else "Status: MOVING BACKWARD"
 
 
         motor_turn = max(min(motor_turn, self.cfg.max_output), -self.cfg.max_output)
@@ -65,14 +65,14 @@ class VisionFollower:
         return motor_turn, motor_speed, action_text
 
     def run(self):
-        logger.info("System initialized. Starting auto-follow loop. Press 'q' to quit.")
+        logger.info("系统初始化，开始自动跟随： 按q退出.")
         
         try:
             while True:
                 start_time = time.time()
                 ret, frame = self.cap.read()
                 if not ret:
-                    logger.warning("Failed to grab frame. Exiting loop.")
+                    logger.warning("获取图像失败，请排查错误，再尝试.")
                     break
 
                 frame = cv2.flip(frame, 1)
@@ -80,7 +80,7 @@ class VisionFollower:
                 results = self.model.track(frame, classes=[self.cfg.target_class], persist=True, verbose=False)
                 
                 motor_turn, motor_speed = 0.0, 0.0
-                action_text = "Status: SEARCHING"
+                action_text = "状态: 搜索"
 
                 if results and results[0].boxes and results[0].boxes.id is not None:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -120,22 +120,23 @@ class VisionFollower:
                 cv2.imshow("Vision Based Auto-Following", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("User requested shutdown.")
+                    logger.info("用户请求终止自动跟随....")
+                    logger.info("自动跟随已关闭")
                     break
                     
         except KeyboardInterrupt:
-            logger.info("Process interrupted by user (Ctrl+C).")
+            logger.info("跟随被中断 (Ctrl+C).")
         except Exception as e:
-            logger.error(f"Unexpected error occurred: {e}", exc_info=True)
+            logger.error(f"未知错误: {e}", exc_info=True)
         finally:
             self.cleanup()
 
     def cleanup(self):
-        logger.info("Releasing resources...")
+        logger.info("释放资源...")
         if self.cap and self.cap.isOpened():
             self.cap.release()
         cv2.destroyAllWindows()
-        logger.info("System shutdown complete.")
+        logger.info("资源释放完成.")
 
 def main():
     config = FollowerConfig()
