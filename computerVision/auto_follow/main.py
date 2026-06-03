@@ -8,14 +8,14 @@ from ultralytics import YOLO
 
 @dataclass
 class FollowerConfig:
-    model_name: str = 'yolov8n.pt'
-    camera_id: int = 0
-    target_class: int = 0        # 0: person
-    safe_area: int = 80000
-    area_tolerance: int = 10000
-    kp_turn: float = 0.1
-    kp_speed: float = 0.0005
-    max_output: float = 50.0
+    model_name  = 'yolov8n.pt'
+    camera_id  = 0
+    target_class  = 0        # 0: person
+    safe_area  = 80000
+    area_tolerance  = 10000
+    kp_turn  = 0.1
+    kp_speed  = 0.0005
+    max_output  = 50.0
 
 
 logging.basicConfig(
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class VisionFollower:
-    def __init__(self, config: FollowerConfig):
+    def __init__(self, config):
         self.cfg = config
         self.model = self._init_model()
         self.cap = self._init_camera()
@@ -37,7 +37,7 @@ class VisionFollower:
         self.center_x = self.frame_width // 2
         self.center_y = self.frame_height // 2
 
-    def _init_model(self) -> YOLO:
+    def _init_model(self):
         logger.info(f"Loading YOLO model: {self.cfg.model_name}...")
         try:
             return YOLO(self.cfg.model_name)
@@ -45,7 +45,7 @@ class VisionFollower:
             logger.error(f"Failed to load model: {e}")
             raise
 
-    def _init_camera(self) -> cv2.VideoCapture:
+    def _init_camera(self):
         logger.info(f"Opening camera {self.cfg.camera_id}...")
         cap = cv2.VideoCapture(self.cfg.camera_id)
         if not cap.isOpened():
@@ -53,7 +53,7 @@ class VisionFollower:
             raise RuntimeError("Camera initialization failed.")
         return cap
 
-    def calculate_control_signals(self, largest_area: float, target_cx: int) -> Tuple[float, float, str]:
+    def calculate_control_signals(self, largest_area, target_cx):
         error_x = target_cx - self.center_x
         motor_turn = error_x * self.cfg.kp_turn
         
