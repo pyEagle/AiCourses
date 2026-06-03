@@ -1,9 +1,12 @@
 import cv2
 import time
 import logging
+
 from dataclasses import dataclass
-from typing import Optional, Tuple
+
 from ultralytics import YOLO
+
+from config.settings import FollowerConfig
 
 
 @dataclass
