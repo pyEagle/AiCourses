@@ -45,6 +45,7 @@ class VisionFollower:
         return cap
 
     def calculate_control_signals(self, largest_area, target_cx):
+        # TODO: 根据具体业务修改
         error_x = target_cx - self.center_x
         motor_turn = error_x * self.cfg.kp_turn
         
