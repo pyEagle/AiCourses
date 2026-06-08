@@ -1,3 +1,23 @@
+“”“
+my_dataset/
+├── data.yaml
+├── images/
+│   ├── train/    # 存放训练集图片
+│   └── val/      # 存放验证集图片
+└── labels/
+    ├── train/    # 存放训练集 txt 标签
+    └── val/      # 存放验证集 txt 标签
+
+data.yaml
+path: ./my_dataset
+train: images/train
+val: images/val
+
+names:
+  0: defect_type_A
+  1: defect_type_B
+”“”
+
 import os
 from ultralytics import YOLO
 
