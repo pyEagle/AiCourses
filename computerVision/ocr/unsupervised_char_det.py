@@ -101,8 +101,7 @@ def unsupervised_character_detection(image_path):
     
     # 8. 效果可视化
     if flag:
-        cv2.imshow("mask", mask)
-        cv2.imshow("原始图像", vis_img)
+        cv2.imshow("result", vis_img)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     
