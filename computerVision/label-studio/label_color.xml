@@ -1,0 +1,13 @@
+<View>
+  <Header value="Select label and click the image to start"/>
+  <Image name="image" value="$image" zoom="true"/>
+
+  <PolygonLabels name="label" toName="image" strokeWidth="3" pointSize="small" opacity="0.4">
+    <Label value="2c" background="#FFA39E"/>
+    <Label value="3c" background="#D4380D"/>
+    <Label value="4c" background="#FFC069"/>
+    <Label value="5c" background="#AD8B00"/>
+    <Label value="s" background="#D3F261"/>
+    <Label value="y" background="#389E0D"/>
+  </PolygonLabels>
+</View>
