@@ -1,3 +1,5 @@
+# -*- coding:utf-8 -*-
+
 import os
 import sys
 import math
@@ -196,21 +198,19 @@ class MedicineBoxEmbedder:
         resize_size = int(img_size * 1.0625)
 
         # 🔧 调整点7：大幅削弱数据增强，防止药盒细节被破坏
-        # 原: RandomRotation degrees=15, RandomPerspective distortion_scale=0.2 p=0.2, ColorJitter brightness=0.3 contrast=0.3 hue=0.05
-        #      GaussianBlur p=0.3, RandomErasing p=0.2 scale=(0.02,0.15)
         self.train_transform = transforms.Compose([
             transforms.Resize((resize_size, resize_size)),
             transforms.RandomCrop((img_size, img_size)),
             transforms.RandomApply([
-                transforms.RandomRotation(degrees=12),                # 原 15 → 8
-                transforms.RandomPerspective(distortion_scale=0.1, p=0.1) # 原 0.2,0.2 → 0.1,0.1
-            ], p=0.3),                                                 # 原 0.6 → 0.3
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, hue=0.02),  # 整体减弱
+                transforms.RandomRotation(degrees=12),
+                transforms.RandomPerspective(distortion_scale=0.1, p=0.1)
+            ], p=0.3),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, hue=0.02),
             transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
-            ], p=0.15),                                                # 原 0.3 → 0.15
+            ], p=0.15),
             transforms.ToTensor(),
-            transforms.RandomErasing(p=0.1, scale=(0.02, 0.1), value=0) # 原 p=0.2, scale上限0.15
+            transforms.RandomErasing(p=0.3, scale=(0.05, 0.15), value=0)
         ])
 
         self._grid_cache = {}
@@ -248,8 +248,8 @@ class MedicineBoxEmbedder:
         return imgs
 
     def train_model(self, save_dir='./saved_weights', epochs=1200, batch_size=128):
-        # 🔧 调整点3：提高每类采样数，让batch内正对更多，强化类内聚集（原4→8）
-        m_per_class = 32
+        # 🔧 调整点3：提高每类采样数，让batch内正对更多，强化类内聚集
+        m_per_class = 8
         dataset = MedicineClassificationDataset(self.db_dir, transform=self.train_transform, m_per_class=m_per_class)
 
         if len(dataset.images) == 0:
@@ -296,12 +296,12 @@ class MedicineBoxEmbedder:
             prefetch_factor=4, persistent_workers=True
         )
 
-        # 🔧 调整点4：大幅提高温度，避免嵌入坍塌（原 0.07 → 0.2）
-        criterion = losses.SupConLoss(temperature=0.2)
+        # 🔧 调整点4：大幅提高温度，避免嵌入坍塌
+        criterion = losses.SupConLoss(temperature=0.15)
 
-        # 🔧 调整点5：降低学习率并大幅减小权重衰减（原 lr=3e-4, wd=1e-2）
-        lr = 3e-4
-        weight_decay = 5e-4
+        # 🔧 调整点5：降低学习率并大幅减小权重衰减
+        lr = 1e-4
+        weight_decay = 1e-4
 
         optim_params = list(filter(lambda p: p.requires_grad, self.extractor.parameters())) + \
                        list(self.text_projector.parameters())
@@ -317,7 +317,10 @@ class MedicineBoxEmbedder:
         best_loss = float('inf')
         os.makedirs(save_dir, exist_ok=True)
 
-        print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.2 | LR: {lr} | WD: {weight_decay}")
+        # 🔧 [新增] 语义差分对齐损失权重
+        diff_loss_weight = 0.5
+
+        print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.15 | LR: {lr} | WD: {weight_decay} | DiffLoss: {diff_loss_weight}")
         for epoch in range(epochs):
             total_loss = 0.0
             valid_batches = 0
@@ -325,18 +328,27 @@ class MedicineBoxEmbedder:
             for i, (imgs, labels, _) in enumerate(dataloader):
                 imgs = imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 labels = labels.to(self.device, non_blocking=True)
-                # GPU增强保持关闭，不引入额外噪声
-                #imgs = self.gpu_augmentations(imgs)
+                
                 text_cls = self.cached_text_tensor[labels]
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda'):
                     img_embeddings = self.extractor(imgs)
                     text_embeddings = self.text_projector(text_cls)
 
+                    # [基础] 监督对比损失
                     joint_embeddings = torch.cat([img_embeddings, text_embeddings], dim=0)
                     joint_labels = torch.cat([labels, labels], dim=0)
+                    loss_supcon = criterion(joint_embeddings.float(), joint_labels)
 
-                    loss = criterion(joint_embeddings.float(), joint_labels)
+                    # [新增] 语义差分对齐辅助损失 —— 压缩同类特征簇
+                    shift = img_embeddings.size(0) // 2
+                    if shift > 0:
+                        img_diff = img_embeddings - torch.roll(img_embeddings, shifts=shift, dims=0)
+                        txt_diff = text_embeddings - torch.roll(text_embeddings, shifts=shift, dims=0)
+                        loss_diff = 1.0 - F.cosine_similarity(img_diff, txt_diff, dim=-1).mean()
+                        loss = loss_supcon + diff_loss_weight * loss_diff
+                    else:
+                        loss = loss_supcon
 
                 loss_val = loss.item()
                 if loss_val == 0 or loss_val != loss_val:
@@ -476,7 +488,7 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
 
     parser = argparse.ArgumentParser(description="Medicine Box Embedder Training / Inference")
-    parser.add_argument("db_dir", type=str, nargs="?", default="train724", help="Path to database directory")
+    parser.add_argument("db_dir", type=str, nargs="?", default="train729", help="Path to database directory")
     parser.add_argument("--model_file", type=str, default="/usr/rfzn/xiangyang/model/pt/best_n_722_600_320_16.pt")
     parser.add_argument("--img_size", type=int, default=320)
     parser.add_argument("--infer_img", type=str, default="")
@@ -494,7 +506,7 @@ if __name__ == "__main__":
             print(f"👀 前 10 个特征值预览: \n{emb[:10]}")
             print("="*50 + "\n")
         else:
-            embedder.train_model(save_dir="./saved_weights", epochs=1200, batch_size=128)
+            embedder.train_model(save_dir="./saved_weights", epochs=350, batch_size=256)
             onnx_file = "./saved_weights/medicine_embedder_best_rknn_opt.onnx"
             if os.path.exists(onnx_file):
                 print("\n" + "="*60)
