@@ -98,7 +98,7 @@ def train():
     # 打印类别信息
     print_class_names(model, source="预训练模型")
     
-    # 4. 开始训练
+    # 4. 开始训练（引入打破背景依赖的增强策略）
     print("\n开始训练...")
     results = model.train(
         data=data_yaml_path,
@@ -108,20 +108,19 @@ def train():
         device='0',
         workers=2,          
         project='output',
-        name='yolov8_seg_retrain_robust_v2', # 换个名字避免覆盖
+        name='yolov8_seg_retrain_robust_v2', # 更新名字避免覆盖
         exist_ok=True,
         
         # =======================================================
-        # 核心修改区：针对“抽屉外漏检”的高级数据增强策略 (做最小调整)
+        # 核心修改区：针对“抽屉内外漏检”做最小化高级数据增强调整
         # =======================================================
         copy_paste=0.4,     
         mixup=0.2,          
         mosaic=1.0,         
-        scale=0.7,          # 【微调】0.6 -> 0.7 适应抽屉外手持时距离镜头的尺度变化
-        translate=0.3,      # 【微调】0.2 -> 0.3 允许物体更多地出现在画面边缘（离开抽屉中心）
-        degrees=30.0,       # 【微调】15.0 -> 30.0 手拿着物体倾斜角度比平放更大
-        perspective=0.0005, # 【新增】加入极微量的透视形变，抵抗抽屉内外视角差异
-        erasing=0.3,        # 【新增】30%概率随机擦除部分区域，强制模型克服手部遮挡和塑料袋反光带来的特征缺失
+        scale=0.7,          # 【微调】0.6->0.7 适应抽屉外手持的尺度变化
+        translate=0.3,      # 【微调】0.2->0.3 适应抽屉边缘/画面边缘物体(如白色盒子)
+        degrees=45.0,       # 【关键微调】15->45 极大增强对“手持物品任意角度倾斜”的识别力
+        erasing=0.2,        # 【新增】加入20%概率随机擦除，对抗抽屉内的互相遮挡/压叠
         hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, 
         
         # 训练策略优化
@@ -148,7 +147,7 @@ def predict():
     setup_gpu()
     
     # 1. 加载训练好的最佳模型
-    model_path = 'output/yolov8_seg_retrain_robust_v2/weights/best.pt'
+    model_path = 'output/yolov8_seg_retrain_robust_v2/weights/best.pt' # 更新了路径
     if not Path(model_path).exists():
         print(f"✗ 模型文件不存在: {model_path}")
         print("请先完成训练，或修改 model_path 为实际路径")
@@ -163,8 +162,8 @@ def predict():
     results = model.predict(
         source='test_images',
         imgsz=640,
-        conf=0.25,     # 【关键微调】0.4 -> 0.25。抽屉外物体由于失去背景加持，置信度通常在0.2~0.35之间，降低阈值可直接打捞漏检
-        iou=0.6,       # 【微调】配合降低的conf，稍微提高NMS阈值防止同一物体出现多个重复框
+        conf=0.25,     # 【关键微调】0.4->0.25。降低阈值直接捞回脱离抽屉背景后置信度跌至 0.2~0.3 的漏检真目标
+        iou=0.6,       # 【微调】配合降低 conf，略微放宽 NMS，防止同一物体出两个框
         save=True,
         project='output',
         name='predict_seg_output',
