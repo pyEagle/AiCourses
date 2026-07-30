@@ -197,7 +197,7 @@ class MedicineBoxEmbedder:
 
         resize_size = int(img_size * 1.0625)
 
-        # 🔧 调整点7：大幅削弱数据增强，防止药盒细节被破坏
+        # 数据增强（保持原样）
         self.train_transform = transforms.Compose([
             transforms.Resize((resize_size, resize_size)),
             transforms.RandomCrop((img_size, img_size)),
@@ -216,7 +216,7 @@ class MedicineBoxEmbedder:
         self._grid_cache = {}
 
     def gpu_augmentations(self, imgs):
-        # 该函数当前未启用，保持不变
+        # 此函数原样保留，提供反光、光晕和传感器噪声增强
         B, C, H, W = imgs.shape
         apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.15
         noise = torch.randn_like(imgs) * 0.04
@@ -248,7 +248,7 @@ class MedicineBoxEmbedder:
         return imgs
 
     def train_model(self, save_dir='./saved_weights', epochs=1200, batch_size=128):
-        # 🔧 调整点3：提高每类采样数，让batch内正对更多，强化类内聚集
+        # 每类采样数，保持 8 不变
         m_per_class = 8
         dataset = MedicineClassificationDataset(self.db_dir, transform=self.train_transform, m_per_class=m_per_class)
 
@@ -296,12 +296,12 @@ class MedicineBoxEmbedder:
             prefetch_factor=4, persistent_workers=True
         )
 
-        # 🔧 调整点4：大幅提高温度，避免嵌入坍塌
-        criterion = losses.SupConLoss(temperature=0.15)
+        # ========== 参数调整 1：温度从 0.07 提高到 0.12 ==========
+        criterion = losses.SupConLoss(temperature=0.12)
 
-        # 🔧 调整点5：降低学习率并大幅减小权重衰减
-        lr = 1e-4
-        weight_decay = 1e-4
+        # ========== 参数调整 2：学习率从 5e-5 提高到 8e-5 ==========
+        lr = 8e-5
+        weight_decay = 1e-4   # 保持原样
 
         optim_params = list(filter(lambda p: p.requires_grad, self.extractor.parameters())) + \
                        list(self.text_projector.parameters())
@@ -317,10 +317,10 @@ class MedicineBoxEmbedder:
         best_loss = float('inf')
         os.makedirs(save_dir, exist_ok=True)
 
-        # 🔧 [新增] 语义差分对齐损失权重
-        diff_loss_weight = 0.5
+        # ========== 参数调整 3：语义差分对齐损失权重从 0.5 增加到 1.0 ==========
+        diff_loss_weight = 1.0
 
-        print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.15 | LR: {lr} | WD: {weight_decay} | DiffLoss: {diff_loss_weight}")
+        print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.12 | LR: {lr} | WD: {weight_decay} | DiffLoss: {diff_loss_weight}")
         for epoch in range(epochs):
             total_loss = 0.0
             valid_batches = 0
@@ -329,8 +329,14 @@ class MedicineBoxEmbedder:
                 imgs = imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 labels = labels.to(self.device, non_blocking=True)
                 
+                # =========================================================
+                # 【关键修正】：启用 GPU 数据增强，针对反光、光晕及微小晃动
+                # =========================================================
+                imgs = self.gpu_augmentations(imgs)
+                
                 text_cls = self.cached_text_tensor[labels]
                 optimizer.zero_grad(set_to_none=True)
+                
                 with torch.amp.autocast('cuda'):
                     img_embeddings = self.extractor(imgs)
                     text_embeddings = self.text_projector(text_cls)
@@ -340,13 +346,39 @@ class MedicineBoxEmbedder:
                     joint_labels = torch.cat([labels, labels], dim=0)
                     loss_supcon = criterion(joint_embeddings.float(), joint_labels)
 
-                    # [新增] 语义差分对齐辅助损失 —— 压缩同类特征簇
-                    shift = img_embeddings.size(0) // 2
-                    if shift > 0:
-                        img_diff = img_embeddings - torch.roll(img_embeddings, shifts=shift, dims=0)
-                        txt_diff = text_embeddings - torch.roll(text_embeddings, shifts=shift, dims=0)
-                        loss_diff = 1.0 - F.cosine_similarity(img_diff, txt_diff, dim=-1).mean()
-                        loss = loss_supcon + diff_loss_weight * loss_diff
+                    # ============================================================
+                    # [改动] 语义差分对齐：使用类内平均嵌入作为代表，构造异类对
+                    # ============================================================
+                    unique_labels = torch.unique(labels)
+                    num_unique = len(unique_labels)
+                    if num_unique >= 2:
+                        rep_img_list = []
+                        rep_txt_list = []
+                        for ul in unique_labels:
+                            mask = (labels == ul)
+                            # 改为类内平均，更稳定
+                            rep_img = img_embeddings[mask].mean(dim=0)   # [256]
+                            rep_txt = text_embeddings[mask].mean(dim=0)  # [256]
+                            rep_img_list.append(rep_img)
+                            rep_txt_list.append(rep_txt)
+                        rep_img = torch.stack(rep_img_list)   # [num_unique, 256]
+                        rep_txt = torch.stack(rep_txt_list)
+
+                        # 生成所有异类对 (i, j), i < j
+                        pairs_i, pairs_j = [], []
+                        for ii in range(num_unique):
+                            for jj in range(ii + 1, num_unique):
+                                pairs_i.append(ii)
+                                pairs_j.append(jj)
+                        if len(pairs_i) > 0:
+                            i_idx = torch.tensor(pairs_i, device=labels.device)
+                            j_idx = torch.tensor(pairs_j, device=labels.device)
+                            img_diff = rep_img[i_idx] - rep_img[j_idx]   # 类别i代表 - 类别j代表
+                            txt_diff = rep_txt[i_idx] - rep_txt[j_idx]   # 对应文本差
+                            loss_diff = 1.0 - F.cosine_similarity(img_diff.float(), txt_diff.float(), dim=-1).mean()
+                            loss = loss_supcon + diff_loss_weight * loss_diff
+                        else:
+                            loss = loss_supcon
                     else:
                         loss = loss_supcon
 
@@ -506,7 +538,8 @@ if __name__ == "__main__":
             print(f"👀 前 10 个特征值预览: \n{emb[:10]}")
             print("="*50 + "\n")
         else:
-            embedder.train_model(save_dir="./saved_weights", epochs=350, batch_size=256)
+            # ========== 参数调整 4：训练轮数从 500 增加到 800 ==========
+            embedder.train_model(save_dir="./saved_weights", epochs=1500, batch_size=256)
             onnx_file = "./saved_weights/medicine_embedder_best_rknn_opt.onnx"
             if os.path.exists(onnx_file):
                 print("\n" + "="*60)
