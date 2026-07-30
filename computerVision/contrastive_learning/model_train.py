@@ -99,6 +99,48 @@ class MedicineClassificationDataset(Dataset):
 # ==========================================
 # 2. 特征提取网络
 # ==========================================
+class MultiScaleAttention(nn.Module):
+    """
+    [架构修复]：优化后的空间与通道注意力机制 (Optimized CBAM)
+    去除了数学上冗余的线性并行卷积，降低 RK3588 NPU 内存带宽压力，
+    保持原有的感受野提取能力，全面兼容 ONNX 与 RKNN。
+    """
+    def __init__(self, channels):
+        super(MultiScaleAttention, self).__init__()
+        reduction = max(8, channels // 8)
+
+        # 1. 通道注意力分支 (Channel Attention)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduction, channels, 1, bias=False)
+        )
+        self.sigmoid_channel = nn.Sigmoid()
+
+        # 2. 空间注意力分支 (Spatial Attention)
+        # 修正：直接使用 7x7 感受野，等效于无激活函数的 3x3 + 5x5 + 7x7
+        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid_spatial = nn.Sigmoid()
+
+    def forward(self, x):
+        # --- Channel Attention ---
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        c_attn = self.sigmoid_channel(avg_out + max_out)
+        x_ca = x * c_attn
+
+        # --- Spatial Attention ---
+        avg_map = torch.mean(x_ca, dim=1, keepdim=True)
+        max_map, _ = torch.max(x_ca, dim=1, keepdim=True)
+        s_map = torch.cat([avg_map, max_map], dim=1)
+
+        s_attn = self.sigmoid_spatial(self.conv_spatial(s_map))
+        
+        return x_ca * s_attn
+
+
 class YOLOv8NeckExtractor(nn.Module):
     def __init__(self, model_file, device, img_size=320):
         super().__init__()
@@ -126,7 +168,11 @@ class YOLOv8NeckExtractor(nn.Module):
         with torch.no_grad():
             features = self.backbone(dummy_input)
 
-        in_channels = features.shape[1] * 2
+        c_in = features.shape[1]
+        
+        self.ms_attention = MultiScaleAttention(c_in).to(device)
+
+        in_channels = c_in * 2
 
         self.embedding_head = nn.Sequential(
             nn.Flatten(1),
@@ -141,6 +187,8 @@ class YOLOv8NeckExtractor(nn.Module):
 
     def forward(self, x):
         features = self.backbone(x)
+        features = self.ms_attention(features)
+        
         avg_f = self.avg_pool(features)
         max_f = self.max_pool(features)
         base_emb = torch.cat([avg_f, max_f], dim=1)
@@ -197,10 +245,15 @@ class MedicineBoxEmbedder:
 
         resize_size = int(img_size * 1.0625)
 
-        # 数据增强（保持原样）
+        # [增强修复]：引入机械震动模糊应对方案
         self.train_transform = transforms.Compose([
             transforms.Resize((resize_size, resize_size)),
             transforms.RandomCrop((img_size, img_size)),
+            
+            # --- 新增：物理震荡模拟 ---
+            # 引入极微小的平移(2%)，模拟流水线上药盒抖动或摄像头轻微晃动产生的拖影/错位
+            transforms.RandomAffine(degrees=0, translate=(0.02, 0.02)),
+            
             transforms.RandomApply([
                 transforms.RandomRotation(degrees=12),
                 transforms.RandomPerspective(distortion_scale=0.1, p=0.1)
@@ -216,7 +269,6 @@ class MedicineBoxEmbedder:
         self._grid_cache = {}
 
     def gpu_augmentations(self, imgs):
-        # 此函数原样保留，提供反光、光晕和传感器噪声增强
         B, C, H, W = imgs.shape
         apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.15
         noise = torch.randn_like(imgs) * 0.04
@@ -248,7 +300,6 @@ class MedicineBoxEmbedder:
         return imgs
 
     def train_model(self, save_dir='./saved_weights', epochs=1200, batch_size=128):
-        # 每类采样数，保持 8 不变
         m_per_class = 8
         dataset = MedicineClassificationDataset(self.db_dir, transform=self.train_transform, m_per_class=m_per_class)
 
@@ -296,12 +347,10 @@ class MedicineBoxEmbedder:
             prefetch_factor=4, persistent_workers=True
         )
 
-        # ========== 参数调整 1：温度从 0.07 提高到 0.12 ==========
         criterion = losses.SupConLoss(temperature=0.12)
 
-        # ========== 参数调整 2：学习率从 5e-5 提高到 8e-5 ==========
         lr = 8e-5
-        weight_decay = 1e-4   # 保持原样
+        weight_decay = 1e-4
 
         optim_params = list(filter(lambda p: p.requires_grad, self.extractor.parameters())) + \
                        list(self.text_projector.parameters())
@@ -317,7 +366,6 @@ class MedicineBoxEmbedder:
         best_loss = float('inf')
         os.makedirs(save_dir, exist_ok=True)
 
-        # ========== 参数调整 3：语义差分对齐损失权重从 0.5 增加到 1.0 ==========
         diff_loss_weight = 1.0
 
         print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.12 | LR: {lr} | WD: {weight_decay} | DiffLoss: {diff_loss_weight}")
@@ -329,9 +377,6 @@ class MedicineBoxEmbedder:
                 imgs = imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 labels = labels.to(self.device, non_blocking=True)
                 
-                # =========================================================
-                # 【关键修正】：启用 GPU 数据增强，针对反光、光晕及微小晃动
-                # =========================================================
                 imgs = self.gpu_augmentations(imgs)
                 
                 text_cls = self.cached_text_tensor[labels]
@@ -341,14 +386,10 @@ class MedicineBoxEmbedder:
                     img_embeddings = self.extractor(imgs)
                     text_embeddings = self.text_projector(text_cls)
 
-                    # [基础] 监督对比损失
                     joint_embeddings = torch.cat([img_embeddings, text_embeddings], dim=0)
                     joint_labels = torch.cat([labels, labels], dim=0)
                     loss_supcon = criterion(joint_embeddings.float(), joint_labels)
 
-                    # ============================================================
-                    # [改动] 语义差分对齐：使用类内平均嵌入作为代表，构造异类对
-                    # ============================================================
                     unique_labels = torch.unique(labels)
                     num_unique = len(unique_labels)
                     if num_unique >= 2:
@@ -356,15 +397,13 @@ class MedicineBoxEmbedder:
                         rep_txt_list = []
                         for ul in unique_labels:
                             mask = (labels == ul)
-                            # 改为类内平均，更稳定
-                            rep_img = img_embeddings[mask].mean(dim=0)   # [256]
-                            rep_txt = text_embeddings[mask].mean(dim=0)  # [256]
+                            rep_img = img_embeddings[mask].mean(dim=0)
+                            rep_txt = text_embeddings[mask].mean(dim=0)
                             rep_img_list.append(rep_img)
                             rep_txt_list.append(rep_txt)
-                        rep_img = torch.stack(rep_img_list)   # [num_unique, 256]
+                        rep_img = torch.stack(rep_img_list)
                         rep_txt = torch.stack(rep_txt_list)
 
-                        # 生成所有异类对 (i, j), i < j
                         pairs_i, pairs_j = [], []
                         for ii in range(num_unique):
                             for jj in range(ii + 1, num_unique):
@@ -373,8 +412,8 @@ class MedicineBoxEmbedder:
                         if len(pairs_i) > 0:
                             i_idx = torch.tensor(pairs_i, device=labels.device)
                             j_idx = torch.tensor(pairs_j, device=labels.device)
-                            img_diff = rep_img[i_idx] - rep_img[j_idx]   # 类别i代表 - 类别j代表
-                            txt_diff = rep_txt[i_idx] - rep_txt[j_idx]   # 对应文本差
+                            img_diff = rep_img[i_idx] - rep_img[j_idx]
+                            txt_diff = rep_txt[i_idx] - rep_txt[j_idx]
                             loss_diff = 1.0 - F.cosine_similarity(img_diff.float(), txt_diff.float(), dim=-1).mean()
                             loss = loss_supcon + diff_loss_weight * loss_diff
                         else:
@@ -538,7 +577,6 @@ if __name__ == "__main__":
             print(f"👀 前 10 个特征值预览: \n{emb[:10]}")
             print("="*50 + "\n")
         else:
-            # ========== 参数调整 4：训练轮数从 500 增加到 800 ==========
             embedder.train_model(save_dir="./saved_weights", epochs=1500, batch_size=256)
             onnx_file = "./saved_weights/medicine_embedder_best_rknn_opt.onnx"
             if os.path.exists(onnx_file):
