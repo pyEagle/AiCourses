@@ -4,224 +4,316 @@ import math
 import os
 import sys
 
-
 class RotateHorizontal:
-    def __init__(self, make_vertical=False, flip_180=False, padding=5):
-        self.make_vertical = make_vertical
-        self.flip_180 = flip_180
-        self.padding = padding  # 裁剪后四周 uniform padding（像素）
+    def __init__(self, make_vertical=False, flip_180=False, 
+                 bg_border_ratio=0.01, mask_kernel_ratio=0.01, 
+                 sharpen_w1=1.3, sharpen_w2=-0.3):
+        self.make_vertical = make_vertical
+        self.flip_180 = flip_180
+        
+        self.bg_border_ratio = bg_border_ratio 
+        self.mask_kernel_ratio = mask_kernel_ratio 
+        self.sharpen_w1 = sharpen_w1
+        self.sharpen_w2 = sharpen_w2
 
-    def pca_to_horizontal(self, img):
-        if img is None:
-            return None
+    def get_adaptive_kernel(self, w, h, ratio=0.01):
+        base_size = min(w, h)
+        k_size = max(3, int(base_size * ratio)) 
+        k_size = k_size + 1 if k_size % 2 == 0 else k_size 
+        return np.ones((k_size, k_size), np.uint8)
 
-        img = img.copy()
+    def perspective_transform(self, orig_img, cropped_mask, crop_x, crop_y, M_affine):
+        if orig_img is None or cropped_mask is None:
+            return None
+            
+        contours, _ = cv2.findContours(cropped_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+            
+        largest_contour = max(contours, key=cv2.contourArea)
+        peri = cv2.arcLength(largest_contour, True)
+        
+        approx = None
+        for eps in np.linspace(0.01, 0.1, 20):
+            temp_approx = cv2.approxPolyDP(largest_contour, eps * peri, True)
+            if len(temp_approx) == 4 and cv2.isContourConvex(temp_approx):
+                approx = temp_approx
+                break
+                
+        if approx is not None:
+            pts = approx.reshape(4, 2)
+        else:
+            rect_minArea = cv2.minAreaRect(largest_contour)
+            box = cv2.boxPoints(rect_minArea)
+            pts = np.array(box, dtype="float32")
+            
+        center = np.mean(pts, axis=0)
+        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+        sorted_pts = pts[np.argsort(angles)]
+        
+        s = sorted_pts.sum(axis=1)
+        tl_idx = np.argmin(s)
+        rect = np.roll(sorted_pts, shift=-tl_idx, axis=0).astype("float32")
+        
+        pts_rot = rect + np.array([crop_x, crop_y], dtype="float32")
+        M_inv = cv2.invertAffineTransform(M_affine)
+        pts_rot_expanded = np.array([pts_rot]) 
+        pts_orig = cv2.transform(pts_rot_expanded, M_inv)[0]
+        
+        widthA = np.sqrt(((rect[2][0] - rect[3][0]) ** 2) + ((rect[2][1] - rect[3][1]) ** 2))
+        widthB = np.sqrt(((rect[1][0] - rect[0][0]) ** 2) + ((rect[1][1] - rect[0][1]) ** 2))
+        maxWidth = max(int(widthA), int(widthB))
+        
+        heightA = np.sqrt(((rect[1][0] - rect[2][0]) ** 2) + ((rect[1][1] - rect[2][1]) ** 2))
+        heightB = np.sqrt(((rect[0][0] - rect[3][0]) ** 2) + ((rect[0][1] - rect[3][1]) ** 2))
+        maxHeight = max(int(heightA), int(heightB))
+        
+        if maxWidth <= 0 or maxHeight <= 0:
+            return None
+            
+        dst = np.array([
+            [0, 0],
+            [maxWidth - 1, 0],
+            [maxWidth - 1, maxHeight - 1],
+            [0, maxHeight - 1]], dtype="float32")
+            
+        M_persp = cv2.getPerspectiveTransform(pts_orig, dst)
+        
+        warped = cv2.warpPerspective(orig_img, M_persp, (maxWidth, maxHeight), 
+                                     flags=cv2.INTER_LANCZOS4, 
+                                     borderMode=cv2.BORDER_CONSTANT, 
+                                     borderValue=(0, 0, 0, 0))
 
-        # BGR → BGRA：用边缘像素估算背景色生成 alpha
-        if len(img.shape) == 3 and img.shape[2] == 3:
-            h, w = img.shape[:2]
-            edge_pixels = np.concatenate([
-                img[0, :], img[h - 1, :], img[:, 0], img[:, w - 1]
-            ], axis=0)
-            bg_color = np.median(edge_pixels, axis=0)
+        dynamic_sigma = max(1.0, min(maxWidth, maxHeight) * 0.002)
+        blurred = cv2.GaussianBlur(warped, (0, 0), dynamic_sigma)
+        
+        warped = cv2.addWeighted(warped, self.sharpen_w1, blurred, self.sharpen_w2, 0)
+        
+        return warped
 
-            diff = np.abs(img.astype(np.int32) - bg_color.astype(np.int32))
-            max_diff = np.max(diff, axis=2)
-            alpha = np.where(max_diff > 8, 255, 0).astype(np.uint8)
+    def pca_to_horizontal(self, img):
+        if img is None:
+            return None
+            
+        img = img.copy()
+        
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            h, w = img.shape[:2]
+            
+            border_size = max(1, int(min(h, w) * self.bg_border_ratio))
+            
+            top_border = img[0:border_size, :]
+            bottom_border = img[h-border_size:h, :]
+            left_border = img[:, 0:border_size]
+            right_border = img[:, w-border_size:w]
+            border_pixels = np.concatenate([
+                top_border.reshape(-1, 3), 
+                bottom_border.reshape(-1, 3), 
+                left_border.reshape(-1, 3), 
+                right_border.reshape(-1, 3)
+            ], axis=0)
+            bg_color = np.median(border_pixels, axis=0)
+            
+            diff = np.abs(img.astype(np.int32) - bg_color.astype(np.int32))
+            max_diff = np.max(diff, axis=2).astype(np.uint8)
+            
+            _, alpha = cv2.threshold(max_diff, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+            img[:, :, 3] = alpha
 
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-            img[:, :, 3] = alpha
+        if len(img.shape) < 3 or img.shape[2] != 4:
+            print("跳过: 无法读取图像或没有Alpha通道")
+            return None
 
-        if len(img.shape) < 3 or img.shape[2] != 4:
-            print("跳过: 无法读取图像或没有Alpha通道")
-            return None
+        mask = img[:, :, 3] 
+        
+        h_orig, w_orig = img.shape[:2]
+        
+        kernel = self.get_adaptive_kernel(w_orig, h_orig, ratio=self.mask_kernel_ratio)
+        
+        eroded_mask = cv2.erode(mask, kernel, iterations=2)
+        contours, _ = cv2.findContours(eroded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            clean_eroded_mask = np.zeros_like(mask)
+            cv2.drawContours(clean_eroded_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+            dilated_mask = cv2.dilate(clean_eroded_mask, kernel, iterations=2)
+            mask = cv2.bitwise_and(mask, dilated_mask)
+            img[:, :, 3] = mask
 
-        alpha_channel = img[:, :, 3]
-        _, mask = cv2.threshold(alpha_channel, 10, 255, cv2.THRESH_BINARY)
+        y_coords, x_coords = np.where(mask > 0)
+        if len(x_coords) == 0:
+            print("跳过: 图像全透明或未识别到有效前景")
+            return None
+        
+        coords = np.empty((len(x_coords), 2), dtype=np.float64)
+        coords[:, 0] = x_coords
+        coords[:, 1] = y_coords
 
-        # 闭运算连接碎片，保留所有有效轮廓
-        close_kernel = np.ones((21, 21), np.uint8)
-        closed_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        mean, eigenvectors, eigenvalues = cv2.PCACompute2(coords, np.empty((0)))
+        dx, dy = eigenvectors[0][0], eigenvectors[0][1]
+        
+        angle = math.atan2(dy, dx) * 180.0 / math.pi
+        rotation_angle = angle
 
-        contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            img_area = mask.shape[0] * mask.shape[1]
-            min_area = img_area * 0.0005
-            clean_mask = np.zeros_like(mask)
-            for contour in contours:
-                if cv2.contourArea(contour) >= min_area:
-                    cv2.drawContours(clean_mask, [contour], -1, 255, thickness=cv2.FILLED)
-            mask = cv2.bitwise_and(mask, clean_mask)
-            img[:, :, 3] = mask
+        if self.make_vertical:
+            rotation_angle += 90
+        if self.flip_180:
+            rotation_angle += 180
 
-        y_coords, x_coords = np.where(mask > 0)
-        if len(x_coords) == 0:
-            print("跳过: 图像全透明或未识别到有效前景")
-            return None
+        center = (w_orig // 2, h_orig // 2)
+        M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
 
-        # 降采样加速
-        max_points = 50000
-        if len(x_coords) > max_points:
-            indices = np.random.RandomState(42).choice(len(x_coords), max_points, replace=False)
-            x_s, y_s = x_coords[indices], y_coords[indices]
-        else:
-            x_s, y_s = x_coords, y_coords
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+        nW = int((h_orig * sin) + (w_orig * cos))
+        nH = int((h_orig * cos) + (w_orig * sin))
 
-        # minAreaRect 计算旋转角度
-        points = np.column_stack((x_s, y_s)).astype(np.int32)
-        rect = cv2.minAreaRect(points)
-        w_rect, h_rect = rect[1]
-        angle_rect = rect[2]
+        M[0, 2] += (nW / 2) - center[0]
+        M[1, 2] += (nH / 2) - center[1]
 
-        rotation_angle = angle_rect if w_rect >= h_rect else angle_rect + 90
-        if rotation_angle > 90:
-            rotation_angle -= 180
-        elif rotation_angle < -90:
-            rotation_angle += 180
+        pts = np.column_stack((x_coords, y_coords)).astype(np.float32)
+        pts_expanded = np.array([pts]) 
+        rotated_pts = cv2.transform(pts_expanded, M)[0]
+        
+        x, y, w, h = cv2.boundingRect(rotated_pts)
 
-        if self.make_vertical:
-            rotation_angle += 90
-        if self.flip_180:
-            rotation_angle += 180
+        if w <= 0 or h <= 0:
+            print("跳过: 旋转后截取不到有效前景")
+            return None
+            
+        clean_mask_temp = np.zeros((nH, nW), dtype=np.uint8)
+        rotated_pts_int = np.int32(rotated_pts)
+        rotated_pts_shifted = rotated_pts_int - np.array([x, y])
+        
+        cropped_mask = np.zeros((h, w), dtype=np.uint8)
+        cropped_mask[rotated_pts_shifted[:, 1], rotated_pts_shifted[:, 0]] = 255
+        
+        cropped_mask = cv2.morphologyEx(cropped_mask, cv2.MORPH_CLOSE, kernel)
 
-        # 旋转
-        h_img, w_img = img.shape[:2]
-        center = (w_img // 2, h_img // 2)
-        M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+        cropped_bgra = self.perspective_transform(img, cropped_mask, x, y, M)
 
-        cos_v = np.abs(M[0, 0])
-        sin_v = np.abs(M[0, 1])
-        nW = int(h_img * sin_v + w_img * cos_v)
-        nH = int(h_img * cos_v + w_img * sin_v)
-        M[0, 2] += nW / 2 - center[0]
-        M[1, 2] += nH / 2 - center[1]
+        if cropped_bgra is None:
+            return None
 
-        rotated_img = cv2.warpAffine(
-            img, M, (nW, nH),
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0)
-        )
+        bgr = cropped_bgra[:, :, :3]
+        if cropped_bgra.shape[2] == 4:
+            alpha_mask = cropped_bgra[:, :, 3].astype(float) / 255.0
+        else:
+            alpha_mask = np.ones((cropped_bgra.shape[0], cropped_bgra.shape[1]), dtype=float)
+        
+        black_background = np.zeros_like(bgr, dtype=np.uint8)
+        
+        for c in range(3):
+            black_background[:, :, c] = (bgr[:, :, c] * alpha_mask).astype(np.uint8)
 
-        # 【核心修改】紧裁 + 均匀 padding，替代原来的对称扩展逻辑
-        a = rotated_img[:, :, 3]
-        _, a_thresh = cv2.threshold(a, 10, 255, cv2.THRESH_BINARY)
+        final_h, final_w = black_background.shape[:2]
+        if final_h > final_w:
+            black_background = cv2.rotate(black_background, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            
+        return black_background
 
-        # 找前景精确边界
-        col_has = np.any(a_thresh > 0, axis=0)
-        row_has = np.any(a_thresh > 0, axis=1)
+    def save_sub_image(self, img_matrix, output_path):
+        if img_matrix is not None:
+            out_dir = os.path.dirname(output_path)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+            cv2.imwrite(output_path, img_matrix)
+            print(f"保存成功: '{output_path}'")
+        else:
+            print(f"保存失败: 图像矩阵为空，无法保存至 '{output_path}'")
 
-        if not np.any(col_has) or not np.any(row_has):
-            return None
+    def one_proc_image(self, input_path, output_path):
+        img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"读取失败或文件不存在: '{input_path}'")
+            return
 
-        col_idx = np.where(col_has)[0]
-        row_idx = np.where(row_has)[0]
+        rotated_img = self.pca_to_horizontal(img)
+        self.save_sub_image(rotated_img, output_path)
 
-        left = col_idx[0]
-        right = col_idx[-1]
-        top = row_idx[0]
-        bottom = row_idx[-1]
+    def batch_proc_image(self, input_dir, output_dir):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"已创建输出目录: {output_dir}")
 
-        # 紧裁边界 + uniform padding
-        pad = self.padding
-        crop_left = max(0, left - pad)
-        crop_top = max(0, top - pad)
-        crop_right = min(nW - 1, right + pad)
-        crop_bottom = min(nH - 1, bottom + pad)
+        valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp')
+        image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir) 
+                       if f.lower().endswith(valid_extensions)]
+        
+        if not image_paths:
+            print(f"在目录 '{input_dir}' 中没有找到受支持的图像文件。")
+            return
 
-        cropped_bgra = rotated_img[crop_top:crop_bottom + 1, crop_left:crop_right + 1]
+        print(f"找到 {len(image_paths)} 张图片，开始批量处理...\n" + "-"*40)
+        
+        for img_path in image_paths:
+            filename = os.path.basename(img_path)
+            out_path = os.path.join(output_dir, filename) 
+            
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                rotated_img = self.pca_to_horizontal(img)
+                self.save_sub_image(rotated_img, out_path)
+            else:
+                print(f"读取失败: '{img_path}'")
+                
+        print("-" * 40 + "\n全部处理完成！")
 
-        return cropped_bgra
+    def buffer_proc_image(self, img_matrix, output_path="debug_output.png", debug=True):
+        rotated_img = self.pca_to_horizontal(img_matrix)
+        
+        if debug and rotated_img is not None:
+            self.save_sub_image(rotated_img, output_path)
+            
+        return rotated_img
 
-    def save_sub_image(self, img_matrix, output_path):
-        if img_matrix is not None:
-            out_dir = os.path.dirname(output_path)
-            if out_dir and not os.path.exists(out_dir):
-                os.makedirs(out_dir)
-            cv2.imwrite(output_path, img_matrix)
-            print(f"保存成功: '{output_path}'")
-        else:
-            print(f"保存失败: 图像矩阵为空，无法保存至 '{output_path}'")
+    def get_real_object(self, image, mask):
+        if image is None or mask is None:
+            print("错误: image 或 mask 输入为空。")
+            return None
 
-    def one_proc_image(self, input_path, output_path):
-        img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f"读取失败或文件不存在: '{input_path}'")
-            return
-        rotated_img = self.pca_to_horizontal(img)
-        self.save_sub_image(rotated_img, output_path)
+        if len(mask.shape) == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
-    def batch_proc_image(self, input_dir, output_dir):
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            print(f"已创建输出目录: {output_dir}")
+        if mask.shape[:2] != image.shape[:2]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-        valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp')
-        image_paths = [
-            os.path.join(input_dir, f) for f in os.listdir(input_dir)
-            if f.lower().endswith(valid_extensions)
-        ]
+        _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
 
-        if not image_paths:
-            print(f"在目录 '{input_dir}' 中没有找到受支持的图像文件。")
-            return
+        if len(image.shape) == 2:
+            image_bgra = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+        elif len(image.shape) == 3 and image.shape[2] == 3:
+            image_bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+        else:
+            image_bgra = image.copy()
 
-        print(f"找到 {len(image_paths)} 张图片，开始批量处理...\n" + "-" * 40)
+        result = cv2.bitwise_and(image_bgra, image_bgra, mask=binary_mask)
 
-        for img_path in image_paths:
-            filename = os.path.basename(img_path)
-            out_path = os.path.join(output_dir, filename)
-            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-            if img is not None:
-                rotated_img = self.pca_to_horizontal(img)
-                self.save_sub_image(rotated_img, out_path)
-            else:
-                print(f"读取失败: '{img_path}'")
+        return result
 
-        print("-" * 40 + "\n全部处理完成！")
-
-    def buffer_proc_image(self, img_matrix, output_path="debug_output.png", debug=True):
-        rotated_img = self.pca_to_horizontal(img_matrix)
-        if debug and rotated_img is not None:
-            self.save_sub_image(rotated_img, output_path)
-        return rotated_img
-
-    def get_real_object(self, image, mask):
-        if image is None or mask is None:
-            print("错误: image 或 mask 输入为空。")
-            return None
-
-        if len(mask.shape) == 3:
-            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-
-        if mask.shape[:2] != image.shape[:2]:
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-
-        if len(image.shape) == 2:
-            image_bgra = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
-        elif len(image.shape) == 3 and image.shape[2] == 3:
-            image_bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
-        else:
-            image_bgra = image.copy()
-
-        return cv2.bitwise_and(image_bgra, image_bgra, mask=binary_mask)
-
-    def get_perfect_object(self, image, mask, output_path="debug_perfect_output.png", debug=True):
-        real_object_img = self.get_real_object(image, mask)
-        if real_object_img is None:
-            print("无法提取 real_object，处理中止。")
-            return None
-        return self.buffer_proc_image(real_object_img, output_path=output_path, debug=debug)
+    def get_perfect_object(self, image, mask, output_path="debug_perfect_output.png", debug=True):
+        real_object_img = self.get_real_object(image, mask)
+        
+        if real_object_img is None:
+            print("无法提取 real_object，处理中止。")
+            return None
+            
+        perfect_object_img = self.buffer_proc_image(real_object_img, output_path=output_path, debug=debug)
+        
+        return perfect_object_img
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("用法: python script.py <输入文件夹路径> <输出文件夹路径>")
-        sys.exit(1)
+    if len(sys.argv) < 3:
+        print("用法: python script.py <输入文件夹路径> <输出文件夹路径>")
+        sys.exit(1)
 
-    input_directory = sys.argv[1]
-    output_directory = sys.argv[2]
+    input_directory = sys.argv[1]
+    output_directory = sys.argv[2]
+    
+    processor = RotateHorizontal(make_vertical=False, flip_180=False)
+    processor.batch_proc_image(input_directory, output_directory)
 
-    processor = RotateHorizontal(make_vertical=False, flip_180=False, padding=5)
-    processor.batch_proc_image(input_directory, output_directory)
