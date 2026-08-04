@@ -6,6 +6,7 @@ import math
 import random
 import argparse
 import multiprocessing
+import json
 
 import numpy as np
 import torch
@@ -65,7 +66,6 @@ class MedicineClassificationDataset(Dataset):
                 temp_texts.append(med_name)
 
         label_counts = Counter(temp_labels)
-        # 自适应过滤：保证留下的类别至少有 m_per_class 张图
         valid_labels = {k for k, v in label_counts.items() if v >= m_per_class}
 
         self.images = []
@@ -97,19 +97,13 @@ class MedicineClassificationDataset(Dataset):
 
 
 # ==========================================
-# 2. 特征提取网络
+# 2. 特征提取网络 (保持结构绝对不变)
 # ==========================================
 class MultiScaleAttention(nn.Module):
-    """
-    [架构修复]：优化后的空间与通道注意力机制 (Optimized CBAM)
-    去除了数学上冗余的线性并行卷积，降低 RK3588 NPU 内存带宽压力，
-    保持原有的感受野提取能力，全面兼容 ONNX 与 RKNN。
-    """
     def __init__(self, channels):
         super(MultiScaleAttention, self).__init__()
         reduction = max(8, channels // 8)
 
-        # 1. 通道注意力分支 (Channel Attention)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.fc = nn.Sequential(
@@ -119,19 +113,15 @@ class MultiScaleAttention(nn.Module):
         )
         self.sigmoid_channel = nn.Sigmoid()
 
-        # 2. 空间注意力分支 (Spatial Attention)
-        # 修正：直接使用 7x7 感受野，等效于无激活函数的 3x3 + 5x5 + 7x7
         self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
         self.sigmoid_spatial = nn.Sigmoid()
 
     def forward(self, x):
-        # --- Channel Attention ---
         avg_out = self.fc(self.avg_pool(x))
         max_out = self.fc(self.max_pool(x))
         c_attn = self.sigmoid_channel(avg_out + max_out)
         x_ca = x * c_attn
 
-        # --- Spatial Attention ---
         avg_map = torch.mean(x_ca, dim=1, keepdim=True)
         max_map, _ = torch.max(x_ca, dim=1, keepdim=True)
         s_map = torch.cat([avg_map, max_map], dim=1)
@@ -243,63 +233,100 @@ class MedicineBoxEmbedder:
 
         self.text_projector = TextProjector(in_features=768, out_features=256).to(self.device)
 
-        resize_size = int(img_size * 1.0625)
-
-        # [增强修复]：引入机械震动模糊应对方案
         self.train_transform = transforms.Compose([
-            transforms.Resize((resize_size, resize_size)),
-            transforms.RandomCrop((img_size, img_size)),
-            
-            # --- 新增：物理震荡模拟 ---
-            # 引入极微小的平移(2%)，模拟流水线上药盒抖动或摄像头轻微晃动产生的拖影/错位
-            transforms.RandomAffine(degrees=0, translate=(0.02, 0.02)),
-            
-            transforms.RandomApply([
-                transforms.RandomRotation(degrees=12),
-                transforms.RandomPerspective(distortion_scale=0.1, p=0.1)
-            ], p=0.3),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, hue=0.02),
-            transforms.RandomApply([
-                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
-            ], p=0.15),
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomAffine(degrees=1, translate=(0.01, 0.01), scale=(0.98, 1.02)),
+            transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.0),
             transforms.ToTensor(),
-            transforms.RandomErasing(p=0.3, scale=(0.05, 0.15), value=0)
         ])
-
-        self._grid_cache = {}
 
     def gpu_augmentations(self, imgs):
         B, C, H, W = imgs.shape
-        apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.15
-        noise = torch.randn_like(imgs) * 0.04
+        apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.1
+        noise = torch.randn_like(imgs) * 0.005
         imgs = torch.where(apply_noise, torch.clamp(imgs + noise, 0., 1.), imgs)
-
-        apply_opt = torch.rand(B, 1, 1, 1, device=self.device) < 0.2
-        cache_key = (H, W)
-        if cache_key not in self._grid_cache:
-            y = torch.arange(0, H, device=self.device, dtype=torch.float32)
-            x = torch.arange(0, W, device=self.device, dtype=torch.float32)
-            y, x = torch.meshgrid(y, x, indexing='ij')
-            self._grid_cache[cache_key] = (x.unsqueeze(0), y.unsqueeze(0))
-
-        x, y = self._grid_cache[cache_key]
-        center_x = (torch.rand(B, 1, 1, device=self.device) * 0.8 + 0.1) * W
-        center_y = (torch.rand(B, 1, 1, device=self.device) * 0.8 + 0.1) * H
-        dist_sq = (x - center_x)**2 + (y - center_y)**2
-        is_glare = torch.rand(B, 1, 1, device=self.device) < 0.5
-        sigma_x = torch.rand(B, 1, 1, device=self.device) * 30 + 10
-        sigma_y = torch.rand(B, 1, 1, device=self.device) * 30 + 10
-        glare_mask = torch.exp(-((x - center_x)**2 / (2 * sigma_x**2) + (y - center_y)**2 / (2 * sigma_y**2)))
-        glare_intensity = torch.rand(B, 1, 1, device=self.device) * 0.4 + 0.4
-        sigma = torch.rand(B, 1, 1, device=self.device) * 90 + 60
-        halo_mask = torch.exp(-(dist_sq) / (2 * sigma**2))
-        halo_intensity = torch.rand(B, 1, 1, device=self.device) * 0.3 + 0.2
-        mask = torch.where(is_glare, glare_mask, halo_mask).unsqueeze(1)
-        intensity = torch.where(is_glare, glare_intensity, halo_intensity).unsqueeze(1)
-        imgs = torch.where(apply_opt, torch.clamp(imgs + mask * intensity, 0., 1.), imgs)
         return imgs
 
-    def train_model(self, save_dir='./saved_weights', epochs=1200, batch_size=128):
+    def _generate_mllm_prompt(self, med_name):
+        """
+        [提示词工程注入模块]
+        直接读取离线配置好的专家级 MLLM 提示词 JSON 文件。
+        """
+        json_path = "mllm_prompts.json"
+        
+        if not hasattr(self, 'mllm_dict'):
+            if os.path.exists(json_path):
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    self.mllm_dict = json.load(f)
+                print(f"✅ 成功加载外部提示词库，包含 {len(self.mllm_dict)} 个类别的富语义增强。")
+            else:
+                print(f"⚠️ 未找到 {json_path}，将使用动态降级模板...")
+                self.mllm_dict = {}
+
+        if med_name in self.mllm_dict:
+            return self.mllm_dict[med_name]
+        else:
+            prompt = (
+                f"这是一个标号为【{med_name}】的临床药品包装盒。作为精确识别对象，它具有独特的制药厂品牌视觉设计。"
+                f"该药盒表面的颜色分布、特定位置的排版格式、防伪标记、以及核心的规格容量文字"
+                f"是区分它与其它近似甚至同品牌不同规格药盒的本质特征。模型需要重点关注盒面的这些边缘轮廓与文字区域的高频细节。"
+            )
+            return prompt
+
+    # =========================================================================================
+    # [集成添加]: MCMC Metropolis-Hastings 负样本采样器 (来自 _0805.py)
+    # 作用：依据当前距离分布建立马尔可夫链，概率化捕获最具信息量的 Hard Negatives
+    # =========================================================================================
+    def _mcmc_sample_negatives(self, sim_mat, mask_neg, num_chains=3, steps=3, temperature=0.1):
+        """
+        利用张量化 Metropolis-Hastings 进行 MCMC 采样。
+        返回一个新的 Mask，仅保留通过 MCMC 筛选出的“优质且难分”的负样本。
+        """
+        N = sim_mat.size(0)
+        mcmc_mask = torch.zeros_like(mask_neg)
+        
+        # 仅让存在负样本的行参与 MCMC，防止类别单一导致概率崩溃
+        valid_rows = mask_neg.sum(dim=1) > 0
+        if not valid_rows.any():
+            return mask_neg  # 容错降级
+            
+        # P(x) \propto exp(sim / T)：相似度越高，越难区分，采样的目标概率越大
+        log_prob = sim_mat.clone().detach() / temperature
+        log_prob[~mask_neg] = -1e4  # 屏蔽正样本和自身
+        
+        valid_mask = mask_neg[valid_rows]
+        valid_log_prob = log_prob[valid_rows]
+        
+        # 初始状态：依据均匀概率随机挑选负样本 (num_chains代表每张图采样几个负样本)
+        current_state = torch.multinomial(valid_mask.float(), num_chains, replacement=True)
+        
+        for _ in range(steps):
+            # Propose (提议)：随机产生新的游走目标
+            proposal_state = torch.multinomial(valid_mask.float(), num_chains, replacement=True)
+            
+            # 计算当前状态与提议状态的对数概率
+            current_lp = torch.gather(valid_log_prob, 1, current_state)
+            proposal_lp = torch.gather(valid_log_prob, 1, proposal_state)
+            
+            # 接受概率 (Acceptance Probability)
+            accept_prob = torch.exp(proposal_lp - current_lp)
+            rand_u = torch.rand_like(accept_prob)
+            
+            # 依照 MH 准则更新马尔可夫链
+            accept = rand_u < accept_prob
+            current_state = torch.where(accept, proposal_state, current_state)
+            
+        # 建立全新的 MCMC 过滤层
+        valid_mcmc_mask = torch.zeros_like(valid_mask)
+        valid_mcmc_mask.scatter_(1, current_state, True)
+        
+        mcmc_mask[valid_rows] = valid_mcmc_mask
+        
+        # 确保选出的样本严格属于原生负样本集合
+        return mcmc_mask & mask_neg
+
+
+    def train_model(self, save_dir='./company_saved_weights', epochs=1200, batch_size=128):
         m_per_class = 8
         dataset = MedicineClassificationDataset(self.db_dir, transform=self.train_transform, m_per_class=m_per_class)
 
@@ -307,13 +334,17 @@ class MedicineBoxEmbedder:
             print("❌ 错误：数据集中没有足够符合要求的图片。")
             return
 
-        print("🚀 正在预计算所有类别的 BERT 特征（只需算 1 次，解放 GPU）...")
+        print("🚀 [多模态提示词引擎已启动] 正在生成富语义 Prompt 并预计算所有类别的 BERT 特征...")
         unique_meds = list(dataset.med2id.keys())
+
+        # 核心注入点：短文本映射为富语义长文本
+        rich_prompts = [self._generate_mllm_prompt(name) for name in unique_meds]
 
         max_label_id = max(dataset.med2id.values()) if dataset.med2id else 0
         self.cached_text_tensor = torch.zeros((max_label_id + 1, 768), device=self.device)
 
-        encoded = self.tokenizer(unique_meds, padding=True, truncation=True, max_length=32, return_tensors='pt').to(self.device)
+        # max_length 提升至 128，保障 MLLM 先验描述不被截断
+        encoded = self.tokenizer(rich_prompts, padding=True, truncation=True, max_length=128, return_tensors='pt').to(self.device)
         with torch.no_grad():
             out = self.text_encoder(**encoded)
             cls_feats = out.last_hidden_state[:, 0, :]
@@ -326,18 +357,11 @@ class MedicineBoxEmbedder:
         del self.tokenizer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("✅ BERT 特征矩阵预计算并常驻 GPU 缓存完毕！")
 
         num_valid_classes = len(set(dataset.labels))
-
         safe_batch_size = min(batch_size, num_valid_classes * m_per_class)
 
-        if safe_batch_size < batch_size:
-            print(f"\n⚠️ 数据集受限提示：当前有效类别数 {num_valid_classes} * m({m_per_class}) = {num_valid_classes * m_per_class} < 设定值 {batch_size}")
-            print(f"👉 已自动将 Batch Size 动态下调至安全极限：{safe_batch_size} (未来增加图片类别数会自动提速)")
-
         actual_batch_size = safe_batch_size
-
         sampler = MPerClassSampler(dataset.labels, m=m_per_class, batch_size=actual_batch_size, length_before_new_iter=len(dataset))
 
         num_workers = 16
@@ -347,9 +371,8 @@ class MedicineBoxEmbedder:
             prefetch_factor=4, persistent_workers=True
         )
 
-        criterion = losses.SupConLoss(temperature=0.12)
-
-        lr = 8e-5
+        criterion = losses.SupConLoss(temperature=0.01)
+        lr = 3e-4
         weight_decay = 1e-4
 
         optim_params = list(filter(lambda p: p.requires_grad, self.extractor.parameters())) + \
@@ -366,9 +389,7 @@ class MedicineBoxEmbedder:
         best_loss = float('inf')
         os.makedirs(save_dir, exist_ok=True)
 
-        diff_loss_weight = 1.0
-
-        print(f"🔥 开始图文对齐精细化训练 | 实际 Batch Size: {actual_batch_size} | Temp: 0.12 | LR: {lr} | WD: {weight_decay} | DiffLoss: {diff_loss_weight}")
+        print(f"🔥 开始极限指标训练 | 核心算法：VLM + MCMC (Metropolis-Hastings) + LogSumExp Margin Constraint")
         for epoch in range(epochs):
             total_loss = 0.0
             valid_batches = 0
@@ -377,6 +398,7 @@ class MedicineBoxEmbedder:
                 imgs = imgs.to(self.device, non_blocking=True, memory_format=torch.channels_last)
                 labels = labels.to(self.device, non_blocking=True)
                 
+                imgs_clean = imgs.clone()
                 imgs = self.gpu_augmentations(imgs)
                 
                 text_cls = self.cached_text_tensor[labels]
@@ -385,22 +407,63 @@ class MedicineBoxEmbedder:
                 with torch.amp.autocast('cuda'):
                     img_embeddings = self.extractor(imgs)
                     text_embeddings = self.text_projector(text_cls)
+                    img_embeddings_clean = self.extractor(imgs_clean)
 
                     joint_embeddings = torch.cat([img_embeddings, text_embeddings], dim=0)
                     joint_labels = torch.cat([labels, labels], dim=0)
                     loss_supcon = criterion(joint_embeddings.float(), joint_labels)
 
+                    loss_inv = 1.0 - F.cosine_similarity(img_embeddings.float(), img_embeddings_clean.float(), dim=-1).mean()
+
+                    sim_mat_img = torch.matmul(img_embeddings.float(), img_embeddings.float().T)
+                    sim_mat_txt = torch.matmul(text_embeddings.float(), text_embeddings.float().T)
+                    
+                    mask_pos = labels.unsqueeze(0) == labels.unsqueeze(1)
+                    mask_neg = ~mask_pos
+                    mask_pos.fill_diagonal_(False)
+
+                    gamma = 32.0         
+                    pos_margin = 0.95    
+                    neg_margin = -0.05   
+                    zeros = torch.zeros(1, device=self.device).float()
+
+                    if mask_pos.any():
+                        pos_sims = sim_mat_img[mask_pos]
+                        pos_args = torch.cat([zeros, -gamma * (pos_sims.float() - pos_margin)])
+                        loss_pos_img = (1.0 / gamma) * torch.logsumexp(pos_args, dim=0)
+                    else:
+                        loss_pos_img = torch.tensor(0.0, device=self.device)
+
+                    # ====================================================================
+                    # [修改点]: 应用 MCMC 动态采样替换原有的全局硬惩罚
+                    # ====================================================================
+                    if mask_neg.any():
+                        # 使用 MCMC 从海量异类组合中猎取高质量目标
+                        mcmc_mask_neg_img = self._mcmc_sample_negatives(sim_mat_img, mask_neg, num_chains=3)
+                        mcmc_mask_neg_txt = self._mcmc_sample_negatives(sim_mat_txt, mask_neg, num_chains=3)
+                        
+                        neg_sims = sim_mat_img[mcmc_mask_neg_img]
+                        neg_args = torch.cat([zeros, gamma * (neg_sims.float() - neg_margin)])
+                        loss_neg_img = (1.0 / gamma) * torch.logsumexp(neg_args, dim=0)
+                        
+                        txt_neg_sims = sim_mat_txt[mcmc_mask_neg_txt]
+                        txt_neg_args = torch.cat([zeros, gamma * (txt_neg_sims.float() - neg_margin)])
+                        loss_neg_txt = (1.0 / gamma) * torch.logsumexp(txt_neg_args, dim=0)
+                    else:
+                        loss_neg_img = torch.tensor(0.0, device=self.device)
+                        loss_neg_txt = torch.tensor(0.0, device=self.device)
+
+                    loss_strict = 15.0 * loss_pos_img + 25.0 * loss_neg_img + 25.0 * loss_neg_txt
+
                     unique_labels = torch.unique(labels)
                     num_unique = len(unique_labels)
+                    
                     if num_unique >= 2:
-                        rep_img_list = []
-                        rep_txt_list = []
+                        rep_img_list, rep_txt_list = [], []
                         for ul in unique_labels:
                             mask = (labels == ul)
-                            rep_img = img_embeddings[mask].mean(dim=0)
-                            rep_txt = text_embeddings[mask].mean(dim=0)
-                            rep_img_list.append(rep_img)
-                            rep_txt_list.append(rep_txt)
+                            rep_img_list.append(img_embeddings[mask].mean(dim=0))
+                            rep_txt_list.append(text_embeddings[mask].mean(dim=0))
                         rep_img = torch.stack(rep_img_list)
                         rep_txt = torch.stack(rep_txt_list)
 
@@ -409,17 +472,19 @@ class MedicineBoxEmbedder:
                             for jj in range(ii + 1, num_unique):
                                 pairs_i.append(ii)
                                 pairs_j.append(jj)
+                                
                         if len(pairs_i) > 0:
                             i_idx = torch.tensor(pairs_i, device=labels.device)
                             j_idx = torch.tensor(pairs_j, device=labels.device)
                             img_diff = rep_img[i_idx] - rep_img[j_idx]
                             txt_diff = rep_txt[i_idx] - rep_txt[j_idx]
                             loss_diff = 1.0 - F.cosine_similarity(img_diff.float(), txt_diff.float(), dim=-1).mean()
-                            loss = loss_supcon + diff_loss_weight * loss_diff
+                            
+                            loss = loss_supcon + 0.1 * loss_diff + 5.0 * loss_inv + loss_strict
                         else:
-                            loss = loss_supcon
+                            loss = loss_supcon + 5.0 * loss_inv + loss_strict
                     else:
-                        loss = loss_supcon
+                        loss = loss_supcon + 5.0 * loss_inv + loss_strict
 
                 loss_val = loss.item()
                 if loss_val == 0 or loss_val != loss_val:
@@ -559,11 +624,11 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
 
     parser = argparse.ArgumentParser(description="Medicine Box Embedder Training / Inference")
-    parser.add_argument("db_dir", type=str, nargs="?", default="train729", help="Path to database directory")
+    parser.add_argument("db_dir", type=str, nargs="?", default="company_train_0804", help="Path to database directory")
     parser.add_argument("--model_file", type=str, default="/usr/rfzn/xiangyang/model/pt/best_n_722_600_320_16.pt")
     parser.add_argument("--img_size", type=int, default=320)
     parser.add_argument("--infer_img", type=str, default="")
-    parser.add_argument("--infer_weight", type=str, default="./saved_weights/medicine_embedder_best_rknn_opt.pth")
+    parser.add_argument("--infer_weight", type=str, default="./company_saved_weights/medicine_embedder_best_rknn_opt.pth")
     args = parser.parse_args()
 
     try:
@@ -577,8 +642,8 @@ if __name__ == "__main__":
             print(f"👀 前 10 个特征值预览: \n{emb[:10]}")
             print("="*50 + "\n")
         else:
-            embedder.train_model(save_dir="./saved_weights", epochs=1500, batch_size=256)
-            onnx_file = "./saved_weights/medicine_embedder_best_rknn_opt.onnx"
+            embedder.train_model(save_dir="./company_saved_weights", epochs=1500, batch_size=256)
+            onnx_file = "./company_saved_weights/medicine_embedder_best_rknn_opt.onnx"
             if os.path.exists(onnx_file):
                 print("\n" + "="*60)
                 print("已跳过 RKNN 转换流程。你可以随后自行转换。")
