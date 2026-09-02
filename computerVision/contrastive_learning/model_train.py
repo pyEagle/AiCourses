@@ -6,25 +6,20 @@ import math
 import random
 import argparse
 import multiprocessing
-import json
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF  
 
 from collections import Counter
-
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from pytorch_metric_learning import losses
 from pytorch_metric_learning.samplers import MPerClassSampler
 
 
-# =========================================================================
-# 阻止子进程扫描硬件
-# =========================================================================
 if multiprocessing.current_process().name != 'MainProcess':
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     os.environ["ORT_LOGGING_LEVEL"] = "4"
@@ -35,9 +30,24 @@ else:
     os.environ["ORT_LOGGING_LEVEL"] = "4"
     os.environ["OMP_NUM_THREADS"] = "4"
 
-# ==========================================
-# 1. Dataset
-# ==========================================
+
+class RandomRightAngleRotation:
+    def __call__(self, img):
+        angle = random.choice([0, 90, 180, 270])
+        if angle == 0:
+            return img
+        return img.rotate(angle, expand=True)
+
+class SquarePad:
+    def __call__(self, image):
+        w, h = image.size
+        max_wh = max(w, h)
+        hp = int((max_wh - w) / 2)
+        vp = int((max_wh - h) / 2)
+        padding = (hp, vp, max_wh - w - hp, max_wh - h - vp)
+        return TF.pad(image, padding, 0, 'constant')
+
+
 class MedicineClassificationDataset(Dataset):
     def __init__(self, db_dir, transform=None, m_per_class=16):
         self.db_dir = db_dir
@@ -96,15 +106,22 @@ class MedicineClassificationDataset(Dataset):
         return img, label, text
 
 
-# ==========================================
-# 2. 特征提取网络 (保持结构绝对不变)
-# ==========================================
+class GeMPooling(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeMPooling, self).__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x):
+        return F.avg_pool2d(x.clamp(min=self.eps).pow(self.p), (x.size(-2), x.size(-1))).pow(1. / self.p)
+
+
 class MultiScaleAttention(nn.Module):
     def __init__(self, channels):
         super(MultiScaleAttention, self).__init__()
         reduction = max(8, channels // 8)
 
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.gem_pool = GeMPooling()
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.fc = nn.Sequential(
             nn.Conv2d(channels, reduction, 1, bias=False),
@@ -112,12 +129,11 @@ class MultiScaleAttention(nn.Module):
             nn.Conv2d(reduction, channels, 1, bias=False)
         )
         self.sigmoid_channel = nn.Sigmoid()
-
-        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False)
         self.sigmoid_spatial = nn.Sigmoid()
 
     def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
+        avg_out = self.fc(self.gem_pool(x))
         max_out = self.fc(self.max_pool(x))
         c_attn = self.sigmoid_channel(avg_out + max_out)
         x_ca = x * c_attn
@@ -125,7 +141,6 @@ class MultiScaleAttention(nn.Module):
         avg_map = torch.mean(x_ca, dim=1, keepdim=True)
         max_map, _ = torch.max(x_ca, dim=1, keepdim=True)
         s_map = torch.cat([avg_map, max_map], dim=1)
-
         s_attn = self.sigmoid_spatial(self.conv_spatial(s_map))
         
         return x_ca * s_attn
@@ -149,19 +164,31 @@ class YOLOv8NeckExtractor(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
-        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1)).to(device)
-        self.max_pool = nn.AdaptiveMaxPool2d((1, 1)).to(device)
-
         self.backbone.eval()
         dummy_input = torch.zeros(2, 3, img_size, img_size, dtype=torch.float32, device=device).contiguous()
 
         with torch.no_grad():
-            features = self.backbone(dummy_input)
+            feats_shallow = None
+            feat = dummy_input
+            for i, layer in enumerate(self.backbone):
+                feat = layer(feat)
+                if i == 4:
+                    feats_shallow = feat 
+            feats_deep = feat            
 
-        c_in = features.shape[1]
+        c_shallow = feats_shallow.shape[1]
+        c_deep = feats_deep.shape[1]
+        c_in = c_deep
         
-        self.ms_attention = MultiScaleAttention(c_in).to(device)
+        self.shallow_proj = nn.Sequential(
+            nn.Conv2d(c_shallow, c_deep, 1, bias=False),
+            nn.BatchNorm2d(c_deep),
+            nn.ReLU(inplace=True)
+        ).to(device)
 
+        self.gem_pool = GeMPooling().to(device)
+        self.max_pool = nn.AdaptiveMaxPool2d((1, 1)).to(device)
+        self.ms_attention = MultiScaleAttention(c_in).to(device)
         in_channels = c_in * 2
 
         self.embedding_head = nn.Sequential(
@@ -176,10 +203,19 @@ class YOLOv8NeckExtractor(nn.Module):
         ).to(device)
 
     def forward(self, x):
-        features = self.backbone(x)
-        features = self.ms_attention(features)
+        feat_shallow = None
+        feat = x
+        for i, layer in enumerate(self.backbone):
+            feat = layer(feat)
+            if i == 4:
+                feat_shallow = feat
+
+        shallow_aligned = self.shallow_proj(feat_shallow)
+        shallow_aligned = F.adaptive_max_pool2d(shallow_aligned, output_size=feat.shape[-2:])
+        feat = feat + shallow_aligned
+        features = self.ms_attention(feat)
         
-        avg_f = self.avg_pool(features)
+        avg_f = self.gem_pool(features)
         max_f = self.max_pool(features)
         base_emb = torch.cat([avg_f, max_f], dim=1)
 
@@ -197,11 +233,8 @@ class TextProjector(nn.Module):
         return F.normalize(out, p=2, dim=1)
 
 
-# ==========================================
-# 3. 训练器
-# ==========================================
 class MedicineBoxEmbedder:
-    def __init__(self, db_dir, model_file, img_size=320):
+    def __init__(self, db_dir, model_file, img_size=640):
         self.db_dir = db_dir
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.img_size = img_size
@@ -210,14 +243,14 @@ class MedicineBoxEmbedder:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.cuda.empty_cache()
-            print("🛡️ 重新启动底层护盾：接管纯 CUDA 上下文并彻底禁用 cuDNN...")
-            torch.backends.cudnn.enabled = False
+            torch.backends.cudnn.enabled = True
+            torch.backends.cudnn.benchmark = True
+            print("🚀 已启用 cuDNN 加速与 TF32 支持，极致训练性能准备就绪！")
             _ = nn.Conv2d(3, 3, 3).to(self.device)(torch.zeros(1, 3, 10, 10).to(self.device))
-            print("✅ 护盾部署完毕：避开崩溃区，随时可以极速训练！")
+            print("✅ CUDA 上下文初始化完成。")
 
         self.extractor = YOLOv8NeckExtractor(model_file, self.device, img_size).to(memory_format=torch.channels_last)
         print("✅ 图像网络构建完成，已完全移入:", self.device)
-
         print("📚 正在加载中文 BERT 模型...")
         try:
             from transformers import BertTokenizer, BertModel
@@ -233,100 +266,39 @@ class MedicineBoxEmbedder:
 
         self.text_projector = TextProjector(in_features=768, out_features=256).to(self.device)
 
+        # ==========================================
+        # [调参重点 1] 保护细粒度特征的数据增强
+        # ==========================================
+        # 针对 1ml、5ml 这种微弱的文字特征，过度裁剪和擦除会导致毁灭性灾难。
         self.train_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomAffine(degrees=1, translate=(0.01, 0.01), scale=(0.98, 1.02)),
-            transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.05, hue=0.0),
+            RandomRightAngleRotation(), 
+            SquarePad(),  
+            transforms.RandomRotation(degrees=180, fill=0), 
+            # 1. 大幅收紧裁剪下限 (0.75 -> 0.95)，几乎只做微小抖动，确保“5ml”等字样绝不被切出画面外
+            transforms.RandomResizedCrop((img_size, img_size), scale=(0.95, 1.0), ratio=(0.9, 1.1)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            # 2. 降低透视形变，防止文字扭曲导致不可读
+            transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+            transforms.RandomAffine(degrees=0, translate=(0.02, 0.02), scale=(0.95, 1.05)),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05), 
+            transforms.RandomGrayscale(p=0.10), 
+            transforms.RandomAutocontrast(p=0.2), 
+            # 3. 极度克制高斯模糊，文字一旦模糊，1 和 5 就会混淆
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5)), 
             transforms.ToTensor(),
+            # 4. 取消大面积遮挡，仅使用极小概率的微小遮挡，防止“命门”被盖住
+            transforms.RandomErasing(p=0.05, scale=(0.01, 0.02), value=0), 
         ])
 
     def gpu_augmentations(self, imgs):
         B, C, H, W = imgs.shape
-        apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.1
-        noise = torch.randn_like(imgs) * 0.005
+        apply_noise = torch.rand(B, 1, 1, 1, device=self.device) < 0.2
+        noise = torch.randn_like(imgs) * 0.01
         imgs = torch.where(apply_noise, torch.clamp(imgs + noise, 0., 1.), imgs)
         return imgs
 
-    def _generate_mllm_prompt(self, med_name):
-        """
-        [提示词工程注入模块]
-        直接读取离线配置好的专家级 MLLM 提示词 JSON 文件。
-        """
-        json_path = "mllm_prompts.json"
-        
-        if not hasattr(self, 'mllm_dict'):
-            if os.path.exists(json_path):
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    self.mllm_dict = json.load(f)
-                print(f"✅ 成功加载外部提示词库，包含 {len(self.mllm_dict)} 个类别的富语义增强。")
-            else:
-                print(f"⚠️ 未找到 {json_path}，将使用动态降级模板...")
-                self.mllm_dict = {}
-
-        if med_name in self.mllm_dict:
-            return self.mllm_dict[med_name]
-        else:
-            prompt = (
-                f"这是一个标号为【{med_name}】的临床药品包装盒。作为精确识别对象，它具有独特的制药厂品牌视觉设计。"
-                f"该药盒表面的颜色分布、特定位置的排版格式、防伪标记、以及核心的规格容量文字"
-                f"是区分它与其它近似甚至同品牌不同规格药盒的本质特征。模型需要重点关注盒面的这些边缘轮廓与文字区域的高频细节。"
-            )
-            return prompt
-
-    # =========================================================================================
-    # [集成添加]: MCMC Metropolis-Hastings 负样本采样器 (来自 _0805.py)
-    # 作用：依据当前距离分布建立马尔可夫链，概率化捕获最具信息量的 Hard Negatives
-    # =========================================================================================
-    def _mcmc_sample_negatives(self, sim_mat, mask_neg, num_chains=3, steps=3, temperature=0.1):
-        """
-        利用张量化 Metropolis-Hastings 进行 MCMC 采样。
-        返回一个新的 Mask，仅保留通过 MCMC 筛选出的“优质且难分”的负样本。
-        """
-        N = sim_mat.size(0)
-        mcmc_mask = torch.zeros_like(mask_neg)
-        
-        # 仅让存在负样本的行参与 MCMC，防止类别单一导致概率崩溃
-        valid_rows = mask_neg.sum(dim=1) > 0
-        if not valid_rows.any():
-            return mask_neg  # 容错降级
-            
-        # P(x) \propto exp(sim / T)：相似度越高，越难区分，采样的目标概率越大
-        log_prob = sim_mat.clone().detach() / temperature
-        log_prob[~mask_neg] = -1e4  # 屏蔽正样本和自身
-        
-        valid_mask = mask_neg[valid_rows]
-        valid_log_prob = log_prob[valid_rows]
-        
-        # 初始状态：依据均匀概率随机挑选负样本 (num_chains代表每张图采样几个负样本)
-        current_state = torch.multinomial(valid_mask.float(), num_chains, replacement=True)
-        
-        for _ in range(steps):
-            # Propose (提议)：随机产生新的游走目标
-            proposal_state = torch.multinomial(valid_mask.float(), num_chains, replacement=True)
-            
-            # 计算当前状态与提议状态的对数概率
-            current_lp = torch.gather(valid_log_prob, 1, current_state)
-            proposal_lp = torch.gather(valid_log_prob, 1, proposal_state)
-            
-            # 接受概率 (Acceptance Probability)
-            accept_prob = torch.exp(proposal_lp - current_lp)
-            rand_u = torch.rand_like(accept_prob)
-            
-            # 依照 MH 准则更新马尔可夫链
-            accept = rand_u < accept_prob
-            current_state = torch.where(accept, proposal_state, current_state)
-            
-        # 建立全新的 MCMC 过滤层
-        valid_mcmc_mask = torch.zeros_like(valid_mask)
-        valid_mcmc_mask.scatter_(1, current_state, True)
-        
-        mcmc_mask[valid_rows] = valid_mcmc_mask
-        
-        # 确保选出的样本严格属于原生负样本集合
-        return mcmc_mask & mask_neg
-
-
-    def train_model(self, save_dir='./company_saved_weights', epochs=1200, batch_size=128):
+    def train_model(self, save_dir='./saved_weights', epochs=1200, batch_size=64):
         m_per_class = 8
         dataset = MedicineClassificationDataset(self.db_dir, transform=self.train_transform, m_per_class=m_per_class)
 
@@ -334,17 +306,12 @@ class MedicineBoxEmbedder:
             print("❌ 错误：数据集中没有足够符合要求的图片。")
             return
 
-        print("🚀 [多模态提示词引擎已启动] 正在生成富语义 Prompt 并预计算所有类别的 BERT 特征...")
+        print("🚀 正在预计算所有类别的 BERT 特征（只需算 1 次，解放 GPU）...")
         unique_meds = list(dataset.med2id.keys())
-
-        # 核心注入点：短文本映射为富语义长文本
-        rich_prompts = [self._generate_mllm_prompt(name) for name in unique_meds]
-
         max_label_id = max(dataset.med2id.values()) if dataset.med2id else 0
         self.cached_text_tensor = torch.zeros((max_label_id + 1, 768), device=self.device)
 
-        # max_length 提升至 128，保障 MLLM 先验描述不被截断
-        encoded = self.tokenizer(rich_prompts, padding=True, truncation=True, max_length=128, return_tensors='pt').to(self.device)
+        encoded = self.tokenizer(unique_meds, padding=True, truncation=True, max_length=32, return_tensors='pt').to(self.device)
         with torch.no_grad():
             out = self.text_encoder(**encoded)
             cls_feats = out.last_hidden_state[:, 0, :]
@@ -360,8 +327,8 @@ class MedicineBoxEmbedder:
 
         num_valid_classes = len(set(dataset.labels))
         safe_batch_size = min(batch_size, num_valid_classes * m_per_class)
-
         actual_batch_size = safe_batch_size
+        
         sampler = MPerClassSampler(dataset.labels, m=m_per_class, batch_size=actual_batch_size, length_before_new_iter=len(dataset))
 
         num_workers = 16
@@ -371,9 +338,8 @@ class MedicineBoxEmbedder:
             prefetch_factor=4, persistent_workers=True
         )
 
-        criterion = losses.SupConLoss(temperature=0.01)
-        lr = 3e-4
-        weight_decay = 1e-4
+        lr = 2.0e-4  
+        weight_decay = 5e-4 
 
         optim_params = list(filter(lambda p: p.requires_grad, self.extractor.parameters())) + \
                        list(self.text_projector.parameters())
@@ -383,13 +349,11 @@ class MedicineBoxEmbedder:
 
         self.extractor.train()
         self.text_projector.train()
-
         scaler = torch.amp.GradScaler('cuda')
-
         best_loss = float('inf')
         os.makedirs(save_dir, exist_ok=True)
 
-        print(f"🔥 开始极限指标训练 | 核心算法：VLM + MCMC (Metropolis-Hastings) + LogSumExp Margin Constraint")
+        print(f"🔥 开始细粒度极限训练 | 超大 Scale + CosFace Margin + GeM")
         for epoch in range(epochs):
             total_loss = 0.0
             valid_batches = 0
@@ -401,90 +365,85 @@ class MedicineBoxEmbedder:
                 imgs_clean = imgs.clone()
                 imgs = self.gpu_augmentations(imgs)
                 
-                text_cls = self.cached_text_tensor[labels]
                 optimizer.zero_grad(set_to_none=True)
                 
                 with torch.amp.autocast('cuda'):
                     img_embeddings = self.extractor(imgs)
-                    text_embeddings = self.text_projector(text_cls)
                     img_embeddings_clean = self.extractor(imgs_clean)
-
-                    joint_embeddings = torch.cat([img_embeddings, text_embeddings], dim=0)
-                    joint_labels = torch.cat([labels, labels], dim=0)
-                    loss_supcon = criterion(joint_embeddings.float(), joint_labels)
-
-                    loss_inv = 1.0 - F.cosine_similarity(img_embeddings.float(), img_embeddings_clean.float(), dim=-1).mean()
-
-                    sim_mat_img = torch.matmul(img_embeddings.float(), img_embeddings.float().T)
-                    sim_mat_txt = torch.matmul(text_embeddings.float(), text_embeddings.float().T)
                     
-                    mask_pos = labels.unsqueeze(0) == labels.unsqueeze(1)
-                    mask_neg = ~mask_pos
-                    mask_pos.fill_diagonal_(False)
-
-                    gamma = 32.0         
-                    pos_margin = 0.95    
-                    neg_margin = -0.05   
-                    zeros = torch.zeros(1, device=self.device).float()
-
-                    if mask_pos.any():
-                        pos_sims = sim_mat_img[mask_pos]
-                        pos_args = torch.cat([zeros, -gamma * (pos_sims.float() - pos_margin)])
-                        loss_pos_img = (1.0 / gamma) * torch.logsumexp(pos_args, dim=0)
-                    else:
-                        loss_pos_img = torch.tensor(0.0, device=self.device)
-
-                    # ====================================================================
-                    # [修改点]: 应用 MCMC 动态采样替换原有的全局硬惩罚
-                    # ====================================================================
+                    k_rot = random.choice([1, 2, 3]) 
+                    imgs_rot = torch.rot90(imgs_clean, k=k_rot, dims=[2, 3])
+                    img_embeddings_rot = self.extractor(imgs_rot)
+                    loss_rot = 1.0 - F.cosine_similarity(img_embeddings_clean, img_embeddings_rot, dim=-1).mean()
+                    
+                    unique_labels, inverse_indices = torch.unique(labels, return_inverse=True)
+                    unique_text_cls = self.cached_text_tensor[unique_labels]
+                    unique_text_emb = self.text_projector(unique_text_cls)
+                    
+                    # ==========================================
+                    # [调参重点 2] 极限细粒度区分：大幅拉升尺度和间距
+                    # ==========================================
+                    # 强行要求不同型号的注射器之间留出极宽的护城河
+                    m_cos = 0.50        # (原0.35) 极高标准，强制产生清晰界限
+                    logit_scale = 64.0  # (原30.0) 工业级 ArcFace/CosFace 标准值，让微小像素差异导致梯度的巨幅变化
+                    
+                    # 图像推向对应文本
+                    sim_i2t = torch.matmul(img_embeddings, unique_text_emb.T)
+                    one_hot_i2t = torch.zeros_like(sim_i2t).scatter_(1, inverse_indices.unsqueeze(1), 1.0)
+                    sim_i2t_margin = sim_i2t - one_hot_i2t * m_cos
+                    logits_i2t = sim_i2t_margin * logit_scale
+                    loss_i2t = F.cross_entropy(logits_i2t, inverse_indices)
+                    
+                    # 文本中心绝对排斥
+                    sim_t2t = torch.matmul(unique_text_emb, unique_text_emb.T)
+                    one_hot_t2t = torch.eye(len(unique_labels), device=self.device)
+                    sim_t2t_margin = sim_t2t - one_hot_t2t * m_cos
+                    logits_t2t = sim_t2t_margin * logit_scale
+                    labels_txt = torch.arange(len(unique_labels), device=self.device)
+                    loss_t2t = F.cross_entropy(logits_t2t, labels_txt)
+                    
+                    # 绝对死区 Hinge Loss
+                    sim_mat_img = torch.matmul(img_embeddings, img_embeddings.T)
+                    
+                    # A. 负样本（异类）处理：形成距离黑洞
+                    mask_neg = labels.unsqueeze(0) != labels.unsqueeze(1)
                     if mask_neg.any():
-                        # 使用 MCMC 从海量异类组合中猎取高质量目标
-                        mcmc_mask_neg_img = self._mcmc_sample_negatives(sim_mat_img, mask_neg, num_chains=3)
-                        mcmc_mask_neg_txt = self._mcmc_sample_negatives(sim_mat_txt, mask_neg, num_chains=3)
-                        
-                        neg_sims = sim_mat_img[mcmc_mask_neg_img]
-                        neg_args = torch.cat([zeros, gamma * (neg_sims.float() - neg_margin)])
-                        loss_neg_img = (1.0 / gamma) * torch.logsumexp(neg_args, dim=0)
-                        
-                        txt_neg_sims = sim_mat_txt[mcmc_mask_neg_txt]
-                        txt_neg_args = torch.cat([zeros, gamma * (txt_neg_sims.float() - neg_margin)])
-                        loss_neg_txt = (1.0 / gamma) * torch.logsumexp(txt_neg_args, dim=0)
+                        sim_mat_neg = sim_mat_img.clone()
+                        sim_mat_neg[~mask_neg] = -1.0 
+                        hardest_neg_sims, _ = sim_mat_neg.max(dim=1)
+                        # 【下压异类界限】要求异类相似度必须跌破 -0.20，确保负数
+                        loss_hard_neg = F.relu(hardest_neg_sims - (-0.20)).mean()
                     else:
-                        loss_neg_img = torch.tensor(0.0, device=self.device)
-                        loss_neg_txt = torch.tensor(0.0, device=self.device)
-
-                    loss_strict = 15.0 * loss_pos_img + 25.0 * loss_neg_img + 25.0 * loss_neg_txt
-
-                    unique_labels = torch.unique(labels)
-                    num_unique = len(unique_labels)
+                        loss_hard_neg = torch.tensor(0.0, device=self.device)
+                        
+                    # B. 正样本（同类）处理：形成高密度星系
+                    mask_pos = labels.unsqueeze(0) == labels.unsqueeze(1)
+                    mask_pos.fill_diagonal_(False) 
                     
-                    if num_unique >= 2:
-                        rep_img_list, rep_txt_list = [], []
-                        for ul in unique_labels:
-                            mask = (labels == ul)
-                            rep_img_list.append(img_embeddings[mask].mean(dim=0))
-                            rep_txt_list.append(text_embeddings[mask].mean(dim=0))
-                        rep_img = torch.stack(rep_img_list)
-                        rep_txt = torch.stack(rep_txt_list)
-
-                        pairs_i, pairs_j = [], []
-                        for ii in range(num_unique):
-                            for jj in range(ii + 1, num_unique):
-                                pairs_i.append(ii)
-                                pairs_j.append(jj)
-                                
-                        if len(pairs_i) > 0:
-                            i_idx = torch.tensor(pairs_i, device=labels.device)
-                            j_idx = torch.tensor(pairs_j, device=labels.device)
-                            img_diff = rep_img[i_idx] - rep_img[j_idx]
-                            txt_diff = rep_txt[i_idx] - rep_txt[j_idx]
-                            loss_diff = 1.0 - F.cosine_similarity(img_diff.float(), txt_diff.float(), dim=-1).mean()
-                            
-                            loss = loss_supcon + 0.1 * loss_diff + 5.0 * loss_inv + loss_strict
-                        else:
-                            loss = loss_supcon + 5.0 * loss_inv + loss_strict
+                    if mask_pos.any():
+                        sim_mat_pos = sim_mat_img.clone()
+                        sim_mat_pos[~mask_pos] = 1.0 
+                        hardest_pos_sims = sim_mat_pos.min(dim=1)[0]
+                        # 【上抬同类界限】要求同类星系聚集密度必须高达 0.90，远远保障测试时大于0.65
+                        loss_hard_pos = F.relu(0.90 - hardest_pos_sims).mean()
                     else:
-                        loss = loss_supcon + 5.0 * loss_inv + loss_strict
+                        loss_hard_pos = torch.tensor(0.0, device=self.device)
+
+                    loss_inv = 1.0 - F.cosine_similarity(img_embeddings, img_embeddings_clean, dim=-1).mean()
+                    
+                    w_i2t = 4.0
+                    w_t2t = 1.0
+                    w_neg = 5.0
+                    w_pos = 5.0
+                    w_inv = 0.5 
+                    w_rot = 0.5 
+
+                    loss = (w_i2t * loss_i2t + 
+                            w_t2t * loss_t2t + 
+                            w_neg * loss_hard_neg + 
+                            w_pos * loss_hard_pos + 
+                            w_inv * loss_inv + 
+                            w_rot * loss_rot) 
 
                 loss_val = loss.item()
                 if loss_val == 0 or loss_val != loss_val:
@@ -501,7 +460,7 @@ class MedicineBoxEmbedder:
             current_lr = optimizer.param_groups[0]['lr']
 
             if (epoch + 1) % 10 == 0 or epoch == 0:
-                print(f"Epoch [{epoch+1:03d}/{epochs:03d}] | Multi-Modal Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
+                print(f"Epoch [{epoch+1:03d}/{epochs:03d}] | Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
 
             if avg_loss < best_loss and valid_batches > 0:
                 best_loss = avg_loss
@@ -529,12 +488,12 @@ class MedicineBoxEmbedder:
 
         checkpoint = torch.load(weight_path, map_location=self.device)
         if "extractor" in checkpoint:
-            self.extractor.load_state_dict(checkpoint["extractor"])
+            self.extractor.load_state_dict(checkpoint["extractor"], strict=False)
             if "text_projector" in checkpoint:
-                self.text_projector.load_state_dict(checkpoint["text_projector"])
+                self.text_projector.load_state_dict(checkpoint["text_projector"], strict=False)
                 self.text_projector.eval()
         else:
-            self.extractor.load_state_dict(checkpoint)
+            self.extractor.load_state_dict(checkpoint, strict=False)
 
         self.extractor.eval()
         print(f"✅ 成功加载精调模型权重: {weight_path}")
@@ -554,6 +513,7 @@ class MedicineBoxEmbedder:
             raise TypeError("不支持的图像格式，请传入图片路径(str)、PIL.Image 或 numpy.ndarray")
 
         infer_transform = transforms.Compose([
+            SquarePad(),  
             transforms.Resize((self.img_size, self.img_size)),
             transforms.ToTensor()
         ])
@@ -624,11 +584,11 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
 
     parser = argparse.ArgumentParser(description="Medicine Box Embedder Training / Inference")
-    parser.add_argument("db_dir", type=str, nargs="?", default="company_train_0804", help="Path to database directory")
-    parser.add_argument("--model_file", type=str, default="/usr/rfzn/xiangyang/model/pt/best_n_722_600_320_16.pt")
+    parser.add_argument("db_dir", type=str, nargs="?", default="train_0902", help="Path to database directory")
+    parser.add_argument("--model_file", type=str, default="best_n_0901_3000_16.pt")
     parser.add_argument("--img_size", type=int, default=320)
     parser.add_argument("--infer_img", type=str, default="")
-    parser.add_argument("--infer_weight", type=str, default="./company_saved_weights/medicine_embedder_best_rknn_opt.pth")
+    parser.add_argument("--infer_weight", type=str, default="./saved_weights/embedder_best_rknn_opt.pth")
     args = parser.parse_args()
 
     try:
@@ -642,11 +602,11 @@ if __name__ == "__main__":
             print(f"👀 前 10 个特征值预览: \n{emb[:10]}")
             print("="*50 + "\n")
         else:
-            embedder.train_model(save_dir="./company_saved_weights", epochs=1500, batch_size=256)
-            onnx_file = "./company_saved_weights/medicine_embedder_best_rknn_opt.onnx"
+            embedder.train_model(save_dir="./saved_weights", epochs=2000, batch_size=128)
+            onnx_file = "./saved_weights/embedder_best_rknn_opt.onnx"
             if os.path.exists(onnx_file):
                 print("\n" + "="*60)
-                print("已跳过 RKNN 转换流程。你可以随后自行转换。")
+                print("已跳过 RKNN 转换流程。你可以随后转换。")
     except Exception as e:
         import traceback; traceback.print_exc()
         print(f"运行出错: {e}")
