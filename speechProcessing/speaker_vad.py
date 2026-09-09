@@ -1,4 +1,3 @@
-cat speaker_vad.py 
 # -*- coding:utf-8 -*-
 
 import numpy as np
@@ -65,7 +64,10 @@ def robust_vad(data, sr=16000, frame_len=0.03, hop_len=0.015):
     energies = np.mean(frames**2, axis=1)
     smoothed_energies = np.convolve(energies, np.ones(5)/5, mode='same')
     
-    dynamic_energy_th = max(1e-5, np.median(smoothed_energies) * 2.0)
+    peak_energy = np.max(smoothed_energies)
+    noise_floor = np.min(smoothed_energies)
+    dynamic_energy_th = noise_floor + (peak_energy - noise_floor) * 0.05
+    
     active_frames = np.where(smoothed_energies > dynamic_energy_th)[0]
     
     if len(active_frames) == 0: return data
