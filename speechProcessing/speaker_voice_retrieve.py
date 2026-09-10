@@ -77,7 +77,8 @@ class VoicePrintSystem:
         self.projector = None
 
         if self.engine == "pytorch":
-            if not TORCH_AVAILABLE: raise RuntimeError("PyTorch missing.")
+            if not TORCH_AVAILABLE: 
+                raise RuntimeError("PyTorch missing.")
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model = AutoModel(model=model_file, disable_update=True)
             
@@ -108,7 +109,8 @@ class VoicePrintSystem:
                 self.projector = None
                 
         elif self.engine == "rknn":
-            if not RKNNLITE_AVAILABLE: raise RuntimeError("RKNNLite missing.")
+            if not RKNNLITE_AVAILABLE: 
+                raise RuntimeError("RKNNLite missing.")
             self.rknn_lite = RKNNLite()
             self.rknn_lite.load_rknn("./speaker_combined_model.rknn")
             self.rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_2)
@@ -163,8 +165,10 @@ class VoicePrintSystem:
 
     def preprocessing_in_memory(self, input_audio_path, apply_vad=True):
         sr, data = wavfile.read(input_audio_path)
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+
         orig_dtype = data.dtype
-        
         if orig_dtype == np.int16:
             data = data.astype(np.float32)
         elif orig_dtype == np.int32:
@@ -180,7 +184,8 @@ class VoicePrintSystem:
             
         if apply_vad:
             data = self.robust_vad(data, sr=sr)
-            if len(data) < sr * 0.3: raise ValueError("Audio too short after VAD")
+            if len(data) < sr * 0.3: 
+                raise ValueError("Audio too short after VAD")
         
         return data
 
@@ -240,7 +245,8 @@ class VoicePrintSystem:
             return [("UNKNOWN", 0.0)]
             
         with self.write_lock:
-            if not self.db_features: return [("UNKNOWN", 0.0)]
+            if not self.db_features: 
+                return [("UNKNOWN", 0.0)]
             db_feats = np.array(self.db_features, dtype=np.float32)
             db_lbls = list(self.db_labels)
             
@@ -257,135 +263,7 @@ class VoicePrintSystem:
         results = [(unique_labels[i], float(sims[i])) for i in range(len(unique_labels))]
         results.sort(key=lambda x: x[1], reverse=True)
         
-        if results[0][1] < threshold:
-            return [("UNKNOWN", results[0][1])]
-            
-        # if len(results) > 1 and (results[0][1] - results[1][1] < margin):
-        #     return [("UNKNOWN", results[0][1])]
+        if not results or results[0][1] < threshold:
+            return [("UNKNOWN", results[0][1] if results else 0.0)]
         
         return results[:topk]
-
-
-def build_db(vp, build_dir):
-    if os.path.isdir(build_dir):
-        wav_files = glob.glob(os.path.join(build_dir, "*.wav"))
-        for wav_path in wav_files:
-            filename = os.path.basename(wav_path)
-            parts = os.path.splitext(filename)[0].split('_')
-            if len(parts) >= 3:
-                name = parts[2]
-                try:
-                    vp.register(wav_path, name)
-                    print(f"OK: {name} <- {filename}")
-                except Exception as e:
-                    print(f"FAIL {filename}: {e}")
-    else:
-        print("INVALID PATH")
-
-def test_db(vp, test_data_path):
-    with vp.write_lock:
-        if not vp.db_features:
-            print("❌ Database empty")
-            return
-        db_feats = np.array(vp.db_features, dtype=np.float32)
-        db_lbls = list(vp.db_labels)
-        
-    speaker_embs = collections.defaultdict(list)
-    for feat, label in zip(db_feats, db_lbls):
-        speaker_embs[label].append(feat)
-
-    test_queries = []
-    if os.path.isdir(test_data_path):
-        wav_files = glob.glob(os.path.join(test_data_path, "*.wav"))
-        for path in wav_files:
-            filename = os.path.basename(path)
-            parts = os.path.splitext(filename)[0].split('_')
-            if len(parts) >= 3:
-                test_queries.append((path, filename, parts[2]))
-    else:
-        with open(test_data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                path = line.strip().split()[0]
-                filename = os.path.basename(path)
-                parts = os.path.splitext(filename)[0].split('_')
-                if len(parts) >= 3:
-                    test_queries.append((path, filename, parts[2]))
-                
-    if not test_queries:
-        print("❌ 未在测试列表中找到有效的音频文件。")
-        return
-
-    print(f"✅ 共扫描到 {len(test_queries)} 个测试音频，库中包含 {len(speaker_embs)} 个人员类别")
-    print("🚀 正在批量提取特征，请稍候...")
-
-    embedding_cache = {} 
-    for path, filename, true_name in test_queries:
-        try:
-            embedding_cache[path] = vp.voice_print(path)
-        except Exception as e:
-            print(f"FAIL {filename}: {e}")
-
-    print("✅ 特征提取完毕！\n")
-    print("--- 相似度测试结果 ---")
-    print(f"{'测试文件名':<28} | {'测试人':<10} | {'异类最高相似度(预期低)':<22} || {'同类最低相似度(预期高)':<22}")
-    print("-" * 95)
-
-    pos_sims_all = []
-    neg_sims_all = []
-    results_stat = []
-
-    for path, filename, true_name in test_queries:
-        if path not in embedding_cache:
-            continue
-            
-        query_emb = embedding_cache[path]
-        
-        if true_name not in speaker_embs:
-            print(f"{filename:<28} | {true_name:<10} | ⚠️ 库中无此人数据")
-            continue
-
-        same_feats = speaker_embs[true_name]
-        sims_positive = [float(np.dot(query_emb, feat)) for feat in same_feats]
-        min_sim_positive = min(sims_positive) if sims_positive else 0.0
-
-        sims_negative = []
-        for label, feats in speaker_embs.items():
-            if label != true_name:
-                sims_negative.extend([float(np.dot(query_emb, feat)) for feat in feats])
-        
-        max_sim_negative = max(sims_negative) if sims_negative else 0.0
-
-        pos_sims_all.append(min_sim_positive)
-        neg_sims_all.append(max_sim_negative)
-        results_stat.append((min_sim_positive, max_sim_negative))
-        print(f"{filename:<28} | {true_name:<10} | {max_sim_negative:.4f}                   || {min_sim_positive:.4f}")
-
-    print("\n" + "=" * 80)
-    print("📊 汇总统计")
-    print("=" * 80)
-    if neg_sims_all:
-        print(f"  异类最高相似度 (越低越好)  → 均值: {np.mean(neg_sims_all):.4f}  最大: {np.max(neg_sims_all):.4f}  最小: {np.min(neg_sims_all):.4f}")
-    if pos_sims_all:
-        print(f"  同类最低相似度 (越高越好)  → 均值: {np.mean(pos_sims_all):.4f}  最大: {np.max(pos_sims_all):.4f}  最小: {np.min(pos_sims_all):.4f}")
-    
-    if pos_sims_all and neg_sims_all:
-        gap = np.mean(pos_sims_all) - np.mean(neg_sims_all)
-        print(f"  类间间距 (越大越好)        → {gap:.4f}")
-        gaps = [p - n for p, n in results_stat]
-        acc = sum(1 for g in gaps if g > 0) / len(gaps) * 100
-        print(f"  Accuracy (同类最低 > 异类最高): {acc:.2f}%")
-    print("=" * 80)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", type=str, default="pytorch", choices=["pytorch", "rknn"])
-    parser.add_argument("--db_path", type=str, default="./model/my_vp_db.npz")
-    parser.add_argument("--build", type=str)
-    parser.add_argument("--test_data", type=str)
-    parser.add_argument("--top_k", type=int, default=1)
-    args = parser.parse_args()
-    
-    vp = VoicePrintSystem(engine=args.engine, db_path=args.db_path)
-    if args.build: build_db(vp, args.build)
-    if args.test_data: test_db(vp, args.test_data)
-
