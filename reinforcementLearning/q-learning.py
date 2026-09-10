@@ -82,7 +82,10 @@ class QLearningAgent:
             return np.random.randint(self.n_actions)
 
         q_values = self.Q[state]
-        return int(torch.argmax(q_values).item())
+        
+        max_q = torch.max(q_values)
+        best_actions = torch.where(q_values == max_q)[0]
+        return int(best_actions[np.random.randint(len(best_actions))].item())
 
     def update(self, s, a, r, s_next, done):
         with torch.no_grad():
@@ -169,4 +172,3 @@ if __name__ == "__main__":
     env, agent, rewards = train()
     plot_rewards(rewards)
     visualize_policy(env, agent)
-
