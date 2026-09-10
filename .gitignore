@@ -22,3 +22,13 @@
 *.bak
 *.tmp
 *.swp
+
+# Models
+*.pt
+*.onnx
+*.rknn
+*.bin
+
+# Datasets
+*dataset/images/*
+*dataset/labels/*
