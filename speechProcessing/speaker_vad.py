@@ -6,7 +6,7 @@ from collections import deque
 class SpeakerVAD:
     def __init__(self, chunk_dur, energy_thres, silence_dur, min_dur, max_dur, pre_roll_len):
         self.chunk_dur = chunk_dur
-        self.energy_thres = energy_thres
+        self.base_energy_thres = energy_thres
         self.silence_limit = int(silence_dur / chunk_dur)
         self.min_chunks = int(min_dur / chunk_dur)
         self.max_chunks = int(max_dur / chunk_dur)
@@ -18,6 +18,8 @@ class SpeakerVAD:
         is_speaking = False
         silence_count = 0
         
+        current_noise_floor = self.base_energy_thres
+        
         while True:
             try:
                 chunk = next(audio_stream)
@@ -28,7 +30,11 @@ class SpeakerVAD:
             rms = np.sqrt(np.mean(chunk_arr.astype(np.float32)**2))
             
             if not is_speaking:
-                if rms > self.energy_thres:
+                current_noise_floor = 0.9 * current_noise_floor + 0.1 * rms
+                
+                trigger_threshold = current_noise_floor + 300
+                
+                if rms > trigger_threshold:
                     is_speaking = True
                     audio_frames.extend(list(pre_roll))
                     audio_frames.append(chunk)
@@ -38,7 +44,9 @@ class SpeakerVAD:
             else:
                 audio_frames.append(chunk)
                 
-                if rms < self.energy_thres:
+                keep_threshold = current_noise_floor + 150
+                
+                if rms < keep_threshold:
                     silence_count += 1
                 else:
                     silence_count = 0
