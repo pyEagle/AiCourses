@@ -69,7 +69,6 @@ class VoicePrintSystem:
         self.fixed_frames = 150
         self.db_path = db_path if db_path.endswith('.npz') else db_path + ".npz"
         
-        # 确保目录存在
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self.write_lock = threading.RLock()
         
@@ -140,8 +139,8 @@ class VoicePrintSystem:
             os.replace(tmp_path, db_path)
             open(index_dummy, 'w').close()
 
-    def register(self, audio_path, name, auto_rebuild=True):
-        norm_emb = self.voice_print(audio_path)
+    def register(self, audio_path, name, auto_rebuild=True, apply_vad=True):
+        norm_emb = self.voice_print(audio_path, apply_vad=apply_vad)
         with self.write_lock:
             if name in self.db_labels:
                 count = self.db_labels.count(name)
@@ -260,8 +259,10 @@ class VoicePrintSystem:
         
         if results[0][1] < threshold:
             return [("UNKNOWN", results[0][1])]
-        if len(results) > 1 and (results[0][1] - results[1][1] < margin):
-            return [("UNKNOWN", results[0][1])]
+            
+        # if len(results) > 1 and (results[0][1] - results[1][1] < margin):
+        #     return [("UNKNOWN", results[0][1])]
+        
         return results[:topk]
 
 
@@ -280,7 +281,6 @@ def build_db(vp, build_dir):
                     print(f"FAIL {filename}: {e}")
     else:
         print("INVALID PATH")
-
 
 def test_db(vp, test_data_path):
     with vp.write_lock:
@@ -326,7 +326,6 @@ def test_db(vp, test_data_path):
             print(f"FAIL {filename}: {e}")
 
     print("✅ 特征提取完毕！\n")
-
     print("--- 相似度测试结果 ---")
     print(f"{'测试文件名':<28} | {'测试人':<10} | {'异类最高相似度(预期低)':<22} || {'同类最低相似度(预期高)':<22}")
     print("-" * 95)
@@ -359,7 +358,6 @@ def test_db(vp, test_data_path):
         pos_sims_all.append(min_sim_positive)
         neg_sims_all.append(max_sim_negative)
         results_stat.append((min_sim_positive, max_sim_negative))
-
         print(f"{filename:<28} | {true_name:<10} | {max_sim_negative:.4f}                   || {min_sim_positive:.4f}")
 
     print("\n" + "=" * 80)
@@ -373,12 +371,10 @@ def test_db(vp, test_data_path):
     if pos_sims_all and neg_sims_all:
         gap = np.mean(pos_sims_all) - np.mean(neg_sims_all)
         print(f"  类间间距 (越大越好)        → {gap:.4f}")
-        
         gaps = [p - n for p, n in results_stat]
         acc = sum(1 for g in gaps if g > 0) / len(gaps) * 100
         print(f"  Accuracy (同类最低 > 异类最高): {acc:.2f}%")
     print("=" * 80)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -390,9 +386,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     vp = VoicePrintSystem(engine=args.engine, db_path=args.db_path)
-    
-    if args.build:
-        build_db(vp, args.build)
-        
-    if args.test_data:
-        test_db(vp, args.test_data)
+    if args.build: build_db(vp, args.build)
+    if args.test_data: test_db(vp, args.test_data)
+
