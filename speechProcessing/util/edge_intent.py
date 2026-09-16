@@ -7,6 +7,7 @@ import numpy as np
 import unicodedata
 import requests
 import jieba
+import pandas as pd  # 新增：用于读取 Excel 文件
 
 from lightgbm import LGBMClassifier
 from collections import defaultdict
@@ -283,27 +284,49 @@ class EdgeIntentEngine:
         return requests.post(self.agent_url, json=payload, timeout=5)
 
 
+def load_dataset_from_excel(excel_path):
+    dataset = []
+    try:
+        df_dict = pd.read_excel(excel_path, sheet_name=None)
+        for sheet_name, df in df_dict.items():
+            print('sheet_name', sheet_name)
+            df.columns = df.columns.str.strip()
+            required_cols = {'句子', '意图', '指令'}
+            if required_cols.issubset(set(df.columns)):
+                df = df.dropna(subset=list(required_cols))
+                for _, row in df.iterrows():
+                    dataset.append({
+                        "句子": str(row['句子']).strip(),
+                        "指令": str(row['指令']).strip(),
+                        "意图": str(row['意图']).strip()
+                    })
+                print(f"[数据加载] 成功从 Sheet '{sheet_name}' 读取数据")
+            else:
+                print(f"[数据警告] Sheet '{sheet_name}' 缺少必要的列 (需包含 句子, 意图, 指令)，已跳过。")
+                
+    except Exception as e:
+        print(f"[数据错误] 读取Excel文件失败: {e}")
+        
+    return dataset
+
+
 # =====================================================================
 # 测试执行模块
 # =====================================================================
 
 def main():
+    import sys
+
     print("\n>>> 初始化 EdgeIntentEngine 测试环境...")
     engine = EdgeIntentEngine()
 
     engine.set_agent_flag(False)
-
-    train_dataset = [
-        {"句子": "开点阿莫西林", "指令": "开药", "意图": "处方开具"},
-        {"句子": "去心血管内科挂号", "指令": "挂号", "意图": "科室预约"},
-        {"句子": "测一下血压", "指令": "测血压", "意图": "体征测量"},
-        {"句子": "我要办理出院", "指令": "出院结算", "意图": "住院办理"},
-        {"句子": "你好", "指令": "看来今天心情不错哦", "意图": "闲聊"},
-        {"句子": "小明小明", "指令": "在的，想聊什么呢", "意图": "闲聊"},
-        {"句子": "打开垃圾箱", "指令": "OpenDustbin", "意图": "打开垃圾箱"},
-        {"句子": "核查", "指令": "Check", "意图": "台账"},
-        {"句子": "你能做什么", "指令": "我是智能助理，可以做很多", "意图": "问答"},
-    ]
+    excel_file = sys.argv[1]
+    
+    print(f"\n>>> 正在从 {excel_file} 构建训练集...")
+    train_dataset = load_dataset_from_excel(excel_file)
+    if not train_dataset:
+        print("[!] Excel 中未读取到有效数据，程序可能无法正常训练！")
 
     print("\n>>> 开始训练引擎...")
     engine.train(train_dataset)

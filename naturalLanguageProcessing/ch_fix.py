@@ -63,7 +63,6 @@ class FastTextWrapper:
         self.indexed_vocab = []
         self.faiss_to_vocab = {}
         
-        # 【性能与精度兼顾修复】：添加本地缓存字典
         self._sim_cache = {}
         self._miss_cache = set()
 
@@ -154,7 +153,7 @@ class FastTextWrapper:
             if w2 not in self.model.wv: self._miss_cache.add(w2)
             return 0.0
 
-    def get_most_similar_idx(self, text, vocab_list, threshold=0.85):
+    def get_most_similar_idx(self, text, vocab_list, threshold=0.65): 
         if not self.model or text in self._miss_cache:
             return None, 0.0
 
@@ -167,7 +166,6 @@ class FastTextWrapper:
                 if best_score >= threshold and int(indices[0][0]) != -1:
                     return self.faiss_to_vocab[int(indices[0][0])], best_score
             except Exception:
-                # 记录无法进行 FAISS 检索的坏词
                 self._miss_cache.add(text)
                 pass
 
@@ -177,7 +175,8 @@ class FastTextWrapper:
             if sim > max_sim:
                 max_sim = sim
                 best_idx = i
-        return best_idx, max_sim if max_sim >= threshold else (None, 0.0)
+        # 修复：增加括号显式约束三元表达式优先级，防止低相似度时返回元组引发误判
+        return (best_idx, max_sim) if max_sim >= threshold else (None, 0.0)
 
 
 class KenLMWrapper:
@@ -210,7 +209,7 @@ class EdgeNgramLM:
                 self.bigrams[(chars[i], chars[i + 1])] += 1
                 self.unigrams[chars[i]] += 1
             self.unigrams[chars[-1]] += 1
-        self.vocab_size = len(self.unigrams)
+        self.vocab_size = max(1, len(self.unigrams))
 
     def score(self, text):
         text_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
@@ -229,7 +228,7 @@ class BM25MedicalASRCorrector:
             with open(medical_vocab, 'r', encoding='utf-8') as f:
                 self.medical_vocab = [line.strip() for line in f if line.strip()]
         else:
-            self.medical_vocab = medical_vocab
+            self.medical_vocab = list(medical_vocab)
             
         self.max_window_size = 0
         self.corpus_tokens = []
@@ -295,6 +294,9 @@ class BM25MedicalASRCorrector:
         exact_match_intervals = self._update_ac_intervals(text)
         proposals = []
         
+        # 修复：原文本基础分在外层单次预计算，避免内层循环重复计算造成算力浪费
+        base_orig_score = self.lm.score(text) if self.lm else -1.0
+        
         i = 0
         while i < len(text):
             ac_matched = [length for (start, length) in exact_match_intervals if start == i]
@@ -323,7 +325,7 @@ class BM25MedicalASRCorrector:
                         final_candidates.add(idx)
                         
                 if self.semantic:
-                    sem_idx, _ = self.semantic.get_most_similar_idx(window_text, self.medical_vocab, threshold=0.85)
+                    sem_idx, _ = self.semantic.get_most_similar_idx(window_text, self.medical_vocab, threshold=0.65)
                     if sem_idx is not None:
                         final_candidates.add(sem_idx)
                         
@@ -342,18 +344,17 @@ class BM25MedicalASRCorrector:
                     semantic_sim = self.semantic.similarity(window_text, target_word) if self.semantic else 0.0
                     
                     is_pinyin_ok = (best_ratio >= allowed_ratio)
-                    is_semantic_ok = (semantic_sim >= 0.85)
+                    is_semantic_ok = (semantic_sim >= 0.65)
                     
                     if (is_pinyin_ok or is_semantic_ok) and window_text != target_word:
                         candidate_text = text[:i] + target_word + text[i+n:]
-                        orig_score = self.lm.score(text) if self.lm else -1
-                        cand_score = self.lm.score(candidate_text) if self.lm else 0
+                        cand_score = self.lm.score(candidate_text) if self.lm else 0.0
                         
                         base_conf = max(best_ratio, semantic_sim)
                         
-                        if self.lm is None or cand_score > orig_score or (cand_score >= orig_score and base_conf >= 0.85):
-                            score_gain = cand_score - orig_score
-                            rank_score = base_conf - (len_diff * 0.15)
+                        if self.lm is None or cand_score > base_orig_score or base_conf >= 0.65:
+                            score_gain = cand_score - base_orig_score
+                            rank_score = base_conf - (len_diff * 0.02)
                             
                             proposals.append({
                                 'start': i,
@@ -364,11 +365,12 @@ class BM25MedicalASRCorrector:
                                 'is_semantic': is_semantic_ok and not is_pinyin_ok,
                                 'pinyin_ratio': best_ratio,
                                 'semantic_sim': semantic_sim,
-                                'len_diff': len_diff
+                                'len_diff': len_diff,
+                                'window_len': len(window_text)
                             })
             i += 1  
 
-        proposals.sort(key=lambda x: (x['rank_score'], x['score_gain'], len(x['target'])), reverse=True)
+        proposals.sort(key=lambda x: (x['rank_score'], x['score_gain'], x['window_len']), reverse=True)
         
         accepted_proposals = []
         for prop in proposals:
@@ -399,32 +401,20 @@ class BM25MedicalASRCorrector:
         return corrected_text
 
 
-def test_ch_fix():
-    correct_dictionary = [
-        "医生", "阿莫西林", "布洛芬", "奥美拉唑", "医用棉", "脱脂棉",
-        "心血管内科", "神经外科", "呼吸科",
-        "静脉注射", "切开", "清创缝合"
-    ]
-    
-    training_corpus = [
-        "医 生 ， 请 给 他 开 一 点 阿 莫 西 林 。",
-        "医 生 ， 请 给 他 开 一 包 脱 脂 棉 。",
-        "患 者 家 属 去 心 血 管 内 科 挂 号 。",
-        "去 呼 吸 科 查 一 下 肺 功 能 。",
-        "准 备 好 工 具 ， 马 上 进 行 清 创 缝 合 。",
-        "立 刻 在 手 臂 上 做 切 开 处 理 。",
-        "他 需 要 马 上 做 那 个 静 脉 注 射 。",
-        "普 通 的 感 冒 ， 多 喝 水 就 行 。",
-        "请 给 那 个 病 人 找 一 下 医 生 。"
-    ]
+def get_correct_dict_list(file_path="correct_dict.txt"):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip() or line.startswith('#')]
 
+
+def test_ch_fix():
+    import sys
+    correct_dict_file = sys.argv[1]
+    correct_dictionary = get_correct_dict_list(correct_dict_file)
+    
     fasttext_engine = FastTextWrapper(model_path="./model/fasttext_model.bin")  
 
     lm_model_path = "./model/medical_lm.bin"
-    if HAS_KENLM and os.path.exists(lm_model_path):
-        lm = KenLMWrapper(lm_model_path)
-    else:
-        lm = EdgeNgramLM(training_corpus)
+    lm = KenLMWrapper(lm_model_path)
 
     corrector = BM25MedicalASRCorrector(
         medical_vocab=correct_dictionary, 
@@ -450,9 +440,4 @@ def test_ch_fix():
 
 
 if __name__ == "__main__":
-    HAS_FAISS = True
-    HAS_AC = True
-    HAS_KENLM = True
-    HAS_FASTTEXT = True
-
     test_ch_fix()
